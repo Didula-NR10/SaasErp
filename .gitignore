@@ -1,0 +1,54 @@
+# Environment variables
+.env
+.env.*
+!.env.example
+
+# Java and Maven
+**/target/
+*.class
+*.jar
+
+# Node.js
+**/node_modules/
+**/dist/
+
+# IDE
+.idea/
+*.iml
+
+# Logs
+*.log
+logs/
+
+# Security
+*.pem
+*.key
+*.jks
+
+# Operating system
+.DS_Store
+Thumbs.db
+
+# Temporary files
+*.tmp
+*.bak
+
+# Additional security
+*.p12
+*.pfx
+*.keystore
+secrets/
+
+# Terraform
+**/.terraform/
+*.tfstate
+*.tfstate.*
+*.tfvars
+!*.example.tfvars
+
+# Testing and coverage
+**/coverage/
+
+# Frontend caches
+**/.vite/
+**/.next/

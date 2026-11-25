@@ -1,0 +1,132 @@
+src/main/java/com/hich
+├─ HichApplication.java
+│
+├─ config
+│   ├─ SecurityConfig.java
+│   ├─ TenantRoutingConfig.java
+│   ├─ FlywayConfig.java
+│   └─ CorsConfig.java
+│
+├─ platform
+│   ├─ billing
+│   │   ├─ api
+│   │   │   ├─ BillingController.java
+│   │   │   ├─ WebhookController.java
+│   │   │   └─ dto/            CheckoutRequest, PaymentResponse
+│   │   ├─ application
+│   │   │   ├─ BillingService.java
+│   │   │   └─ SubscriptionService.java
+│   │   ├─ domain
+│   │   │   ├─ Payment.java
+│   │   │   ├─ Subscription.java
+│   │   │   ├─ WebhookEvent.java
+│   │   │   └─ PaymentConfirmedEvent.java
+│   │   └─ infrastructure
+│   │       ├─ PaymentRepository.java
+│   │       ├─ SubscriptionRepository.java
+│   │       ├─ WebhookEventRepository.java
+│   │       └─ PaymentGatewayClient.java
+│   │
+│   ├─ tenant
+│   │   ├─ api
+│   │   │   ├─ TenantController.java
+│   │   │   └─ dto/            TenantResponse
+│   │   ├─ application
+│   │   │   ├─ TenantService.java
+│   │   │   └─ TenantProvisioner.java          (interface)
+│   │   ├─ domain
+│   │   │   ├─ Tenant.java
+│   │   │   ├─ BusinessType.java               (enum: SALON, BOOKSHOP, ...)
+│   │   │   └─ TenantStatus.java
+│   │   └─ infrastructure
+│   │       ├─ TenantRepository.java
+│   │       ├─ SchemaTenantProvisioner.java
+│   │       ├─ TenantFilter.java
+│   │       ├─ CurrentTenantResolver.java
+│   │       └─ SchemaConnectionProvider.java
+│   │
+│   ├─ auth
+│   │   ├─ api
+│   │   │   ├─ AuthController.java
+│   │   │   └─ dto/            LoginRequest, TokenResponse
+│   │   ├─ application
+│   │   │   └─ AuthService.java
+│   │   ├─ domain
+│   │   │   ├─ User.java
+│   │   │   └─ Role.java
+│   │   └─ infrastructure
+│   │       ├─ UserRepository.java
+│   │       ├─ JwtService.java
+│   │       └─ JwtFilter.java
+│   │
+│   └─ notification
+│       ├─ application
+│       │   ├─ NotificationService.java
+│       │   └─ ReminderScheduler.java
+│       └─ infrastructure
+│           ├─ EmailClient.java
+│           └─ PaymentConfirmedListener.java
+│
+├─ erpcore
+│   ├─ inventory
+│   │   ├─ api            InventoryController.java, dto/
+│   │   ├─ application    InventoryService.java
+│   │   ├─ domain         Product.java, StockMovement.java
+│   │   └─ infrastructure ProductRepository.java, StockMovementRepository.java
+│   ├─ sales
+│   │   ├─ api            SalesController.java, dto/
+│   │   ├─ application    SalesService.java, InvoiceService.java
+│   │   ├─ domain         Invoice.java, InvoiceLine.java, Payment.java
+│   │   └─ infrastructure InvoiceRepository.java
+│   ├─ customers
+│   │   ├─ api            CustomerController.java, dto/
+│   │   ├─ application    CustomerService.java
+│   │   ├─ domain         Customer.java
+│   │   └─ infrastructure CustomerRepository.java
+│   ├─ staff
+│   │   ├─ api            StaffController.java, dto/
+│   │   ├─ application    StaffService.java
+│   │   ├─ domain         Staff.java
+│   │   └─ infrastructure StaffRepository.java
+│   └─ reports
+│       ├─ api            ReportController.java, dto/
+│       └─ application    ReportService.java
+│
+└─ verticals
+    ├─ salon
+    │   ├─ api            AppointmentController.java, ServicePackageController.java, dto/
+    │   ├─ application    AppointmentService.java, CommissionService.java
+    │   ├─ domain         Appointment.java, ServicePackage.java, Commission.java
+    │   └─ infrastructure AppointmentRepository.java, ServicePackageRepository.java
+    ├─ bookshop
+    │   ├─ api            BookController.java, SupplierOrderController.java, dto/
+    │   ├─ application    BookService.java, SupplierOrderService.java
+    │   ├─ domain         Book.java, Author.java, Publisher.java, SupplierOrder.java
+    │   └─ infrastructure BookRepository.java, SupplierOrderRepository.java
+    ├─ mobile
+    │   ├─ api            RepairController.java, ImeiController.java, dto/
+    │   ├─ application    RepairService.java, WarrantyService.java
+    │   ├─ domain         RepairJob.java, DeviceImei.java, Warranty.java, TradeIn.java
+    │   └─ infrastructure RepairRepository.java, DeviceImeiRepository.java
+    └─ vehicle
+        ├─ api            VehicleController.java, ServiceJobController.java, dto/
+        ├─ application    VehicleService.java, ServiceJobService.java, ReminderService.java
+        ├─ domain         Vehicle.java, ServiceJob.java, SparePart.java
+        └─ infrastructure VehicleRepository.java, ServiceJobRepository.java
+
+src/main/resources
+├─ application.yml
+├─ application-prod.yml
+└─ db/migration
+    ├─ billing/    V1__billing_tables.sql
+    ├─ core/       V1__core_tables.sql
+    ├─ salon/      V1__salon_tables.sql
+    ├─ bookshop/   V1__bookshop_tables.sql
+    ├─ mobile/     V1__mobile_tables.sql
+    └─ vehicle/    V1__vehicle_tables.sql
+
+src/test/java/com/hich
+├─ platform/...                      (mirrors the main structure)
+├─ erpcore/...
+├─ verticals/...
+└─ TenantIsolationTest.java          (proves Tenant A cannot read Tenant B)

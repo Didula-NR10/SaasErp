@@ -1,0 +1,50 @@
+{
+  "name": "Hich ERP Development",
+
+  "dockerComposeFile": "../compose.yml",
+
+  "service": "workspace",
+
+  "workspaceFolder": "/workspace",
+
+  "remoteUser": "vscode",
+
+  "shutdownAction": "stopCompose",
+
+  "features": {
+    "ghcr.io/devcontainers/features/java:1": {
+      "version": "21",
+      "installMaven": true
+    },
+
+    "ghcr.io/devcontainers/features/node:1": {
+      "version": "22"
+    }
+  },
+
+  "forwardPorts": [
+    8080,
+    5173
+  ],
+
+  "portsAttributes": {
+    "8080": {
+      "label": "Hich Backend API"
+    },
+    "5173": {
+      "label": "Hich ERP Frontend"
+    }
+  },
+
+  "customizations": {
+    "vscode": {
+      "extensions": [
+        "vscjava.vscode-java-pack",
+        "vmware.vscode-boot-dev-pack",
+        "dbaeumer.vscode-eslint",
+        "esbenp.prettier-vscode",
+        "redhat.vscode-yaml"
+      ]
+    }
+  }
+}
