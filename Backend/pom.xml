@@ -70,7 +70,7 @@
 		<dependency>
 			<groupId>org.postgresql</groupId>
 			<artifactId>postgresql</artifactId>
-			<scope>runtime</scope>
+			<!-- Compile-time access to the driver transaction-state API for safe pool handoff. -->
 		</dependency>
 		<dependency>
 			<groupId>org.springframework.boot</groupId>

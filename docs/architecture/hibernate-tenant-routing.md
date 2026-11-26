@@ -33,11 +33,12 @@ Read-only `javap` inspection of the locally cached dependencies confirmed:
 | PostgreSQL JDBC | 42.7.14 | JDBC connections support PostgreSQL session configuration; `setSchema` alone is insufficient verification. |
 
 The Boot dependency-management POM matches these cached versions. No dependencies
-were added, upgraded or downloaded. This is API inspection, not compilation.
+were added, upgraded or downloaded. Task 06 promotes the existing PostgreSQL driver
+to compile scope for direct server transaction-state inspection. This is API inspection, not compilation.
 
 Hibernate's inherited read-only connection methods delegate to normal acquisition
 and release. The provider declares `handlesConnectionReadOnly() == false`, leaving
-read-only state to Hibernate/Hikari, and `supportsAggressiveRelease() == false`.
+in-use read-only state to Hibernate and restoring pool defaults at handoff, and `supportsAggressiveRelease() == false`.
 It unwraps only to its own class or `MultiTenantConnectionProvider`, never to the
 pool or a raw connection. Null unwrap types are rejected.
 
@@ -73,7 +74,7 @@ subdomain or unverified token claim is accepted by these components.
 The provider receives the existing restricted runtime `HikariDataSource`, never
 a migration or administrator datasource. It has no credential configuration or
 credential fallback. A runtime guard verifies that the effective user equals the
-session login, belongs to `hich_runtime`, has none of the superuser/role-creation/
+explicitly configured session login, belongs to `hich_runtime`, has none of the superuser/role-creation/
 database-creation/replication/RLS-bypass attributes, and has neither database CREATE
 nor TEMP privilege. A tenant schema must exist, grant runtime USAGE and deny runtime
 CREATE. Failure does not create a schema or broaden privileges.
@@ -104,7 +105,8 @@ schema. The explicit `pg_temp` placeholder prevents PostgreSQL from implicitly
 prepending a temporary namespace. An existing temporary namespace is rejected
 altogether, including a namespace whose temporary objects were dropped. This is
 conservative protection against temporary-table/type shadowing; the runtime must
-not have TEMP privilege. Broader session-state hardening remains Task 06.
+not have TEMP privilege. The broader reset policy is specified in
+[PostgreSQL Connection Pool Isolation](connection-pool-isolation.md).
 
 There is no `public`, platform, billing, information-schema, administrator or
 second-tenant entry in the effective tenant path. Nonexistent or inaccessible
@@ -113,55 +115,25 @@ existence/privilege checks and effective-path verification must both succeed.
 
 ## Bootstrap and release lifecycle
 
-`getAnyConnection()` is metadata access, not tenant access. It does not consult an
-active customer context and never invents a bootstrap UUID. It uses the same
-restricted runtime pool and explicitly establishes `pg_catalog, pg_temp` with an
-effective path of exactly `pg_catalog` and no temporary namespace. The null identity
-in the private lease record distinguishes metadata ownership only; it is never a
-resolver return value or customer fallback. Use `releaseAnyConnection()` for it.
+`getAnyConnection()` is metadata access and never invents a customer identity.
+It uses the restricted runtime pool and the verified catalog-only baseline
+`pg_catalog, pg_temp`, with no temporary namespace. `releaseAnyConnection()` and
+tenant releases have distinct ownership contracts. Identity-keyed lease tracking
+rejects unknown, duplicate and mismatched releases.
 
-Every successful acquisition is tracked by connection object identity. Normal
-releases must match the original tenant identity and lease type; bootstrap and
-tenant releases cannot be interchanged. Unknown or already released handles are
-rejected without touching another component's connection. Mismatches on owned
-leases invalidate that lease instead of returning it to the pool.
+Task 06 adds a full PostgreSQL session reset on both acquisition and release,
+checks actual server transaction state in addition to JDBC autocommit, restores
+application settings and verifies retained server resources. Unsafe connections
+are physically evicted without a subsequent proxy close. Closed stale proxies
+cannot evict newer pool leases. Uncertain ownership or failed eviction can stop
+the pool as a last resort. No commit, rollback or setAutoCommit is performed by
+the provider. See [PostgreSQL Connection Pool Isolation](connection-pool-isolation.md)
+for the complete supported ownership contract, settings, driver-cache reasoning,
+failure recovery and limitations.
 
-Release does not require the request's thread-local context to remain present:
-cleanup must still work after a scope closes or an operation fails. It uses the
-recorded lease identity. Normal release rechecks runtime privileges, restores the
-catalog-only baseline, verifies it, and only then closes the proxy back to Hikari.
-It does not restore an arbitrary previous path or reset to a server/user default
-that could expose a previous tenant. When the same pool is shared, subsequent
-central SQL must remain schema-qualified.
-
-Acquisition and release require JDBC autocommit to be enabled at the handoff.
-Hibernate or another transaction owner may disable it while using the connection,
-but must complete its transaction and restore the original autocommit state before
-returning it. The provider never calls commit, rollback or setAutoCommit. A reset
-performed inside a transaction could later be undone by rollback; therefore a
-non-autocommit handoff is rejected and the connection evicted rather than reset
-inside that transaction. This conservative rule may discard an otherwise healthy
-connection whose owner forgot to restore autocommit. It is intentional.
-
-On acquisition, switching, verification, reset or close failure, the provider
-invalidates the original borrowed Hikari proxy using `evictConnection` before any
-ordinary close. Cached Hikari bytecode confirms that eviction marks the pool entry
-evicted and removes the owned entry for physical closure; an ordinary proxy close
-alone is not physical destruction. No unwrapped connection is used for eviction.
-
-If eviction throws, the provider attempts to shut down the pool before closing the
-proxy. This last-resort fail-closed action can interrupt other work sharing that
-pool. If both eviction and shutdown fail, it does not close/recycle the unsafe
-handle; it remains checked out and requires operational recovery. SQL causes and
-suppressed cleanup failures are retained. Top-level messages contain no credentials,
-raw malicious identifier input or customer data; callers must not expose exception
-cause chains through HTTP responses. These components log nothing.
-
-Physical invalidation can abort an unfinished transaction. It does not transfer
-transaction ownership to the provider or issue transaction-control statements on
-another component's behalf. Callers must use standard JDBC transaction control;
-manual SQL BEGIN/COMMIT, direct proxy close/unwrap, concurrent connection use and
-arbitrary connection escape are outside this internal API contract.
+Cleanup still works after a thread-local context closes. Central consumers sharing
+the pool must use schema-qualified SQL. The context must outlive any active tenant
+session, and callers must not bypass provider release through direct proxy close.
 
 ## Future tenant persistence integration
 
@@ -203,124 +175,39 @@ are retrieved; it is not a per-statement authorization check. Do not reuse an
 EntityManager/session across companies or treat resolver validation as proof of
 membership. Async work must independently establish a validated context.
 
-## PostgreSQL test fixtures: proposed human-only setup
+## PostgreSQL test fixtures
 
-Unit tests need no database. Actual integration tests use only `hich_erp_test` and
-`hich_runtime_test`. They do not execute fixture DDL or use administrator/migrator
-credentials. Their dedicated one-connection test pool reuses the configured runtime
-credentials and is closed after each test; it is never a Spring datasource bean.
-This makes same-physical-connection reuse and invalidation assertions deterministic.
+The established source of truth is
+[04_create_test_tenant_fixtures.sql](../../infrastructure/postgres/04_create_test_tenant_fixtures.sql).
+It creates test-only schemas 501 and 502 with markers `task05-a` and `task05-b`,
+schema 503 without runtime USAGE, and deliberately leaves 504 absent. It grants
+only the test runtime's required schema USAGE and table SELECT. Migrators still
+have no database CREATE permission; application tests never create these fixtures
+or use administrator credentials. Missing fixtures fail explicitly.
 
-Current restricted migrators have no database CREATE privilege. Five integration
-test methods require test-only schemas that cannot be automatically provisioned
-under current permissions. They fail explicitly if fixtures are absent; there are
-no assumptions, disabled tests, skip conditions or privilege escalation. Bootstrap,
-central-boundary and nonexistent-schema tests need no added tenant fixture.
-
-A human DBA may review the following proposal, then connect to **hich_erp_test**
-using the existing administrative identity and execute it with psql's fail-fast
-setting. For example, in the existing administrative psql session:
-
-```sql
-\set ON_ERROR_STOP on
-\connect hich_erp_test
-BEGIN;
-DO $task05_fixture_guard$
-BEGIN
-    IF current_database() <> 'hich_erp_test'
-            OR current_user NOT IN ('hich_dev', 'postgres')
-            OR NOT (SELECT rolsuper FROM pg_catalog.pg_roles WHERE rolname = current_user) THEN
-        RAISE EXCEPTION 'Task 05 fixtures require the test database and its administrator';
-    END IF;
-    IF EXISTS (
-        SELECT 1 FROM pg_catalog.pg_namespace
-        WHERE nspname IN (
-            'tenant_00000000000000000000000000000501',
-            'tenant_00000000000000000000000000000502',
-            'tenant_00000000000000000000000000000503',
-            'tenant_00000000000000000000000000000504'
-        )
-    ) THEN
-        RAISE EXCEPTION 'Task 05 fixture names must be unused; inspect existing objects before proceeding';
-    END IF;
-END;
-$task05_fixture_guard$;
-
-CREATE SCHEMA tenant_00000000000000000000000000000501 AUTHORIZATION hich_migrator_test;
-CREATE SCHEMA tenant_00000000000000000000000000000502 AUTHORIZATION hich_migrator_test;
-CREATE SCHEMA tenant_00000000000000000000000000000503 AUTHORIZATION hich_migrator_test;
-REVOKE ALL ON SCHEMA tenant_00000000000000000000000000000501,
-    tenant_00000000000000000000000000000502,
-    tenant_00000000000000000000000000000503
-    FROM PUBLIC, hich_runtime, hich_runtime_dev, hich_runtime_test;
-GRANT USAGE ON SCHEMA tenant_00000000000000000000000000000501,
-    tenant_00000000000000000000000000000502 TO hich_runtime_test;
-
-SET LOCAL ROLE hich_migrator_test;
-CREATE TABLE tenant_00000000000000000000000000000501.routing_probe (
-    marker text PRIMARY KEY
-);
-CREATE TABLE tenant_00000000000000000000000000000502.routing_probe (
-    marker text PRIMARY KEY
-);
-INSERT INTO tenant_00000000000000000000000000000501.routing_probe VALUES ('task05-a');
-INSERT INTO tenant_00000000000000000000000000000502.routing_probe VALUES ('task05-b');
-REVOKE ALL ON TABLE tenant_00000000000000000000000000000501.routing_probe,
-    tenant_00000000000000000000000000000502.routing_probe
-    FROM PUBLIC, hich_runtime, hich_runtime_dev, hich_runtime_test;
-GRANT SELECT ON TABLE tenant_00000000000000000000000000000501.routing_probe,
-    tenant_00000000000000000000000000000502.routing_probe TO hich_runtime_test;
-RESET ROLE;
-COMMIT;
-```
-
-This proposal is not an applied migration or a change to existing permission
-scripts. It creates only three named test schemas, two fixture tables and narrowly
-scoped grants. It never grants database CREATE/TEMP to runtime or migration roles.
-Schema 503 deliberately has no runtime USAGE; schema 504 must remain absent.
-Review ACLs and role defaults before execution. Existing fixtures should be inspected
-and reused after successful setup; the proposal intentionally refuses to overwrite
-or silently adopt existing objects. No automatic drop/reset or cleanup DDL is run.
-
-Fixture-dependent methods are: two-tenant reads, same-backend baseline restoration,
-owned-transaction rollback/reset, transactional handoff eviction and inaccessible
-schema rejection. Positive temporary-schema contamination tests are deferred because
-the runtime has no TEMP privilege; unit tests exercise effective-path rejection.
-The existing database privilege tests continue to verify TEMP denial.
+The fixture script and existing CI fixture invocation are unchanged by Task 06.
+No additional fixture, grant or setup is required. Isolated test-specific pools
+reuse the configured `hich_runtime_test` credentials only against `hich_erp_test`;
+they are not Spring datasource beans. Their bounded sizes permit deterministic
+physical-reuse, eviction and concurrent-tenant assertions.
 
 ## Verification and limits
 
-There are 50 new test methods: 6 resolver, 36 provider unit and 8 PostgreSQL/Spring
-integration tests. With 83 existing test methods, the expected total is 133. These
-are source counts, not executed results. Mockito is used only for deterministic
-JDBC/pool failure paths; existing tenant value/context tests remain unchanged.
-The existing central startup, independent migrations, privilege and ArchUnit tests
-are preserved. No Maven build, test suite, SQL setup or CI run was executed here.
+The Task 06 source contains 53 provider unit tests, 6 resolver tests and 21 routing
+integration tests. With the unchanged remaining tests, the expected total is 163.
+This includes 30 additions to the task brief's 133-test verified baseline. No
+Maven build, automated tests, SQL setup or CI verification was executed by the
+agent. Static review and cached API inspection are not executed verification.
 
-After human review and setup of the restricted test database:
+Use the commands in [PostgreSQL Connection Pool Isolation](connection-pool-isolation.md)
+for unit, architecture, database integration and full Maven verification. Existing
+central startup, independent Flyway migrations, database privileges and tenant
+value/context tests remain intact. Tenant-specific Hibernate persistence-unit
+activation is still deferred and has not been tested as an active application unit.
 
-```bash
-cd /workspace/Backend
-mvn -o -B -ntp -Dtest=TenantIdentifierResolverTest,TenantConnectionProviderTest test
-mvn -o -B -ntp -Dtest=ArchitectureTest,ModuleArchitectureTest,TenantIdTest,TenantSchemaIdentifierTest,TenantContextTest,TenantContextHolderTest test
-mvn -o -B -ntp -Dtest=TenantRoutingDatabaseIntegrationTest test
-mvn -o -B -ntp clean verify
-```
-
-Current CI does not install these proposed fixtures; the fixture-dependent tests
-will fail there until a human authorizes and supplies test-only setup. No CI checks
-were bypassed or modified. Compilation, actual PostgreSQL behavior and CI acceptance
-remain unverified and must not be reported as passing.
-
-A shared runtime database role with access to multiple tenants does not provide
-complete database-enforced isolation against compromised application code. Fully
-qualified cross-tenant SQL can bypass search-path routing. There is no application-
-wide tenant isolation claim. Session/request authorization, provisioning, an active
-tenant persistence unit, per-statement context enforcement and advanced pooled
-session-state hardening remain outside this foundation.
-
-Task 06 must extend testing and hardening for other PostgreSQL session settings,
-prepared statements, connection escape, role changes, manual SQL transaction
-control, aborted transactions, pool concurrency and failure recovery. This task
-already provides the fundamental verified-path reset and fail-closed invalidation;
-it does not claim complete pooled-session isolation.
+A shared runtime role does not enforce complete database isolation against
+compromised application code. Fully qualified SQL can access another schema if
+the role has privileges there. Routing is not authorization or membership proof.
+The session-reset policy applies only within the documented connection ownership
+contract; escaped handles, arbitrary vendor mutations and extension-defined
+resources are not certified. No application-wide tenant isolation is claimed.

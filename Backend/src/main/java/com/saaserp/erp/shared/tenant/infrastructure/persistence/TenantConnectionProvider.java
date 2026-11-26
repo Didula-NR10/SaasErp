@@ -27,7 +27,7 @@ public final class TenantConnectionProvider implements MultiTenantConnectionProv
     private static final String RUNTIME_CHECK = """
             SELECT NOT r.rolsuper AND NOT r.rolcreaterole AND NOT r.rolcreatedb
                 AND NOT r.rolreplication AND NOT r.rolbypassrls
-                AND current_user = session_user
+                AND current_user = session_user AND session_user = ?
                 AND pg_catalog.pg_has_role(current_user, 'hich_runtime', 'MEMBER')
                 AND NOT pg_catalog.has_database_privilege(current_user, pg_catalog.current_database(), 'CREATE')
                 AND NOT pg_catalog.has_database_privilege(current_user, pg_catalog.current_database(), 'TEMP')
@@ -47,11 +47,16 @@ public final class TenantConnectionProvider implements MultiTenantConnectionProv
             """;
 
     private final HikariDataSource runtimePool;
+    private final String expectedRuntimeUser;
     // Identity keys prevent a foreign proxy's equals/hashCode from impersonating an owned lease.
     private final Map<Connection, Lease> leases = Collections.synchronizedMap(new IdentityHashMap<>());
 
     public TenantConnectionProvider(HikariDataSource runtimePool) {
         this.runtimePool = Objects.requireNonNull(runtimePool, "Runtime pool is required");
+        this.expectedRuntimeUser = runtimePool.getUsername();
+        if (expectedRuntimeUser == null || expectedRuntimeUser.isBlank()) {
+            throw new IllegalArgumentException("An explicit runtime database identity is required");
+        }
     }
 
     @Override
@@ -77,16 +82,21 @@ public final class TenantConnectionProvider implements MultiTenantConnectionProv
             throw new SQLException("Unable to acquire a routing connection", failure);
         }
         try {
-            requireAutoCommit(connection);
+            PostgresSessionState.requireIdle(connection);
+            verifyRuntime(connection);
+            PostgresSessionState.reset(connection, runtimePool);
+            setAndVerifyPath(connection, null);
             verifyRuntime(connection);
             String schema = tenantId == null ? null : TenantSchemaIdentifier.from(tenantId).value();
             if (schema != null) {
                 try (PreparedStatement statement = connection.prepareStatement(SCHEMA_CHECK)) {
+                    statement.setQueryTimeout(5);
                     statement.setString(1, schema);
                     requireTrue(statement, "Tenant schema is unavailable to the runtime identity");
                 }
+                setAndVerifyPath(connection, schema);
             }
-            setAndVerifyPath(connection, schema);
+            PostgresSessionState.requireIdle(connection);
             leases.put(connection, new Lease(tenantId == null ? null : tenantId.toString()));
             return connection;
         } catch (SQLException | RuntimeException failure) {
@@ -115,37 +125,54 @@ public final class TenantConnectionProvider implements MultiTenantConnectionProv
         if (lease == null) {
             throw new SQLException("Connection is not an active lease of this provider");
         }
+        // A directly closed Hikari proxy can refer to a pool entry already borrowed
+        // by somebody else. Never evict that stale proxy's newer physical lease.
+        boolean closed;
+        try {
+            closed = connection.isClosed();
+        } catch (SQLException | RuntimeException failure) {
+            SQLException reported = new SQLException("Unable to establish connection lease ownership", failure);
+            stopPool(reported);
+            throw reported;
+        } catch (Error failure) {
+            stopPool(failure);
+            throw failure;
+        }
+        if (closed) {
+            throw new SQLException("Routing connection is already closed");
+        }
         if (bootstrap != (lease.tenantIdentifier() == null)
                 || !Objects.equals(tenantIdentifier, lease.tenantIdentifier())) {
             SQLException failure = new SQLException("Connection release does not match its lease");
             invalidate(connection, failure);
             throw failure;
         }
+        boolean closeAttempted = false;
         try {
             // A session SET inside an unfinished transaction can be undone by rollback.
             // Never toggle autocommit, commit, or roll back somebody else's transaction.
-            requireAutoCommit(connection);
+            PostgresSessionState.requireIdle(connection);
             verifyRuntime(connection);
+            PostgresSessionState.reset(connection, runtimePool);
             setAndVerifyPath(connection, null);
+            verifyRuntime(connection);
+            PostgresSessionState.requireIdle(connection);
+            closeAttempted = true;
             connection.close();
         } catch (SQLException | RuntimeException failure) {
             SQLException reported = new SQLException("Unable to safely release a routing connection", failure);
-            invalidate(connection, reported);
+            invalidate(connection, reported, closeAttempted);
             throw reported;
         } catch (Error failure) {
-            invalidate(connection, failure);
+            invalidate(connection, failure, closeAttempted);
             throw failure;
         }
     }
 
-    private static void requireAutoCommit(Connection connection) throws SQLException {
-        if (!connection.getAutoCommit()) {
-            throw new SQLException("Routing handoff requires an autocommit connection");
-        }
-    }
-
-    private static void verifyRuntime(Connection connection) throws SQLException {
+    private void verifyRuntime(Connection connection) throws SQLException {
         try (PreparedStatement statement = connection.prepareStatement(RUNTIME_CHECK)) {
+            statement.setQueryTimeout(5);
+            statement.setString(1, expectedRuntimeUser);
             requireTrue(statement, "Connection does not satisfy restricted runtime requirements");
         }
     }
@@ -153,6 +180,7 @@ public final class TenantConnectionProvider implements MultiTenantConnectionProv
     private static void setAndVerifyPath(Connection connection, String schema) throws SQLException {
         String path = schema == null ? BASELINE_PATH : schema + ", pg_temp";
         try (PreparedStatement statement = connection.prepareStatement(SET_PATH)) {
+            statement.setQueryTimeout(5);
             statement.setString(1, path);
             try (ResultSet result = statement.executeQuery()) {
                 if (!result.next() || !path.equals(result.getString(1))) {
@@ -161,6 +189,7 @@ public final class TenantConnectionProvider implements MultiTenantConnectionProv
             }
         }
         try (PreparedStatement statement = connection.prepareStatement(PATH_CHECK)) {
+            statement.setQueryTimeout(5);
             statement.setString(1, path);
             statement.setString(2, schema == null ? "pg_catalog" : schema);
             statement.setString(3, schema == null ? "pg_catalog" : "pg_catalog," + schema);
@@ -177,30 +206,35 @@ public final class TenantConnectionProvider implements MultiTenantConnectionProv
     }
 
     private void invalidate(Connection connection, Throwable original) {
-        boolean cannotBeReused = false;
+        invalidate(connection, original, false);
+    }
+
+    private void invalidate(Connection connection, Throwable original, boolean closeAttempted) {
         try {
-            // This is the actual Hikari proxy borrowed from this pool, not an unwrapped connection.
+            if (closeAttempted && connection.isClosed()) {
+                // Hikari can recycle in a finally block before close throws. Do not
+                // evict that old proxy's possibly newer physical lease.
+                throw new SQLException("Connection ownership is uncertain after failed close");
+            }
+            // Eviction removes the pool entry and schedules physical closure. Do NOT
+            // close the proxy afterward: Hikari.close() can issue rollback on a dirty
+            // transaction and can recycle in its finally block. Physical destruction
+            // aborts unfinished work without invoking JDBC transaction control here.
             runtimePool.evictConnection(connection);
-            cannotBeReused = true;
-        } catch (RuntimeException | Error evictionFailure) {
+        } catch (SQLException | RuntimeException | Error evictionFailure) {
             original.addSuppressed(evictionFailure);
-            // An exceptional eviction must not turn into an ordinary close/recycle.
-            try {
-                runtimePool.close();
-                cannotBeReused = runtimePool.isClosed();
-            } catch (RuntimeException | Error shutdownFailure) {
-                original.addSuppressed(shutdownFailure);
-            }
+            stopPool(original);
         }
-        if (cannotBeReused) {
-            try {
-                connection.close();
-            } catch (SQLException | RuntimeException | Error closeFailure) {
-                original.addSuppressed(closeFailure);
-            }
+        // If invalidation and shutdown both fail, leave the unsafe handle checked out.
+        // Never ordinary-close it to recover availability. Operational recovery is required.
+    }
+
+    private void stopPool(Throwable original) {
+        try {
+            runtimePool.close();
+        } catch (RuntimeException | Error shutdownFailure) {
+            original.addSuppressed(shutdownFailure);
         }
-        // If even eviction and pool shutdown fail, retain the checked-out connection:
-        // never recycle it. The reported failure includes both cleanup failures.
     }
 
     @Override
