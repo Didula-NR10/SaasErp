@@ -30,14 +30,14 @@ jobs:
 
         env:
           POSTGRES_DB: hich_erp_test
-          POSTGRES_USER: hich_test
-          POSTGRES_PASSWORD: ci_test_password
+          POSTGRES_USER: hich_dev
+          POSTGRES_PASSWORD: ${{ secrets.CI_POSTGRES_ADMIN_PASSWORD }}
 
         ports:
           - 5432:5432
 
         options: >-
-          --health-cmd "pg_isready -U hich_test -d hich_erp_test"
+          --health-cmd "pg_isready -U hich_dev -d hich_erp_test"
           --health-interval 10s
           --health-timeout 5s
           --health-retries 5
@@ -57,9 +57,15 @@ jobs:
     env:
       DB_HOST: localhost
       DB_PORT: 5432
-      DB_NAME: hich_erp_test
-      DB_USER: hich_test
-      DB_PASSWORD: ci_test_password
+      DB_NAME: hich_erp
+      DB_RUNTIME_USER: hich_runtime_dev
+      DB_MIGRATION_USER: hich_migrator_dev
+
+      TEST_DB_HOST: localhost
+      TEST_DB_PORT: 5432
+      TEST_DB_NAME: hich_erp_test
+      TEST_DB_RUNTIME_USER: hich_runtime_test
+      TEST_DB_MIGRATION_USER: hich_migrator_test
 
       REDIS_HOST: localhost
       REDIS_PORT: 6379
@@ -88,6 +94,72 @@ jobs:
         run: |
           java -version
           mvn -version
+
+      - name: Initialize isolated PostgreSQL roles and databases
+        env:
+          PGPASSWORD: ${{ secrets.CI_POSTGRES_ADMIN_PASSWORD }}
+        run: |
+          set -euo pipefail
+
+          psql --host localhost --username hich_dev --dbname postgres \
+            --no-psqlrc --set ON_ERROR_STOP=1 \
+            --file ../infrastructure/postgres/00_create_roles.sql
+          psql --host localhost --username hich_dev --dbname postgres \
+            --no-psqlrc --set ON_ERROR_STOP=1 \
+            --command "CREATE DATABASE hich_erp OWNER hich_dev"
+          psql --host localhost --username hich_dev --dbname hich_erp \
+            --no-psqlrc --set ON_ERROR_STOP=1 \
+            --file ../infrastructure/postgres/01_configure_hich_erp.sql
+          psql --host localhost --username hich_dev --dbname hich_erp_test \
+            --no-psqlrc --set ON_ERROR_STOP=1 \
+            --file ../infrastructure/postgres/02_configure_hich_erp_test.sql
+
+      - name: Configure ephemeral restricted database credentials
+        env:
+          PGPASSWORD: ${{ secrets.CI_POSTGRES_ADMIN_PASSWORD }}
+        run: |
+          set -euo pipefail
+
+          export DB_MIGRATION_PASSWORD="$(openssl rand -hex 32)"
+          export TEST_DB_MIGRATION_PASSWORD="$(openssl rand -hex 32)"
+          export DB_RUNTIME_PASSWORD="$(openssl rand -hex 32)"
+          export TEST_DB_RUNTIME_PASSWORD="$(openssl rand -hex 32)"
+
+          echo "::add-mask::$DB_MIGRATION_PASSWORD"
+          echo "::add-mask::$TEST_DB_MIGRATION_PASSWORD"
+          echo "::add-mask::$DB_RUNTIME_PASSWORD"
+          echo "::add-mask::$TEST_DB_RUNTIME_PASSWORD"
+
+          {
+            printf 'DB_MIGRATION_PASSWORD=%s\n' "$DB_MIGRATION_PASSWORD"
+            printf 'TEST_DB_MIGRATION_PASSWORD=%s\n' "$TEST_DB_MIGRATION_PASSWORD"
+            printf 'DB_RUNTIME_PASSWORD=%s\n' "$DB_RUNTIME_PASSWORD"
+            printf 'TEST_DB_RUNTIME_PASSWORD=%s\n' "$TEST_DB_RUNTIME_PASSWORD"
+          } >> "$GITHUB_ENV"
+
+          psql --host localhost --username hich_dev --dbname postgres \
+            --no-psqlrc --set ON_ERROR_STOP=1 \
+            --file ../infrastructure/postgres/03_set_ci_credentials.sql
+
+      - name: Install isolated tenant routing test fixtures
+        env:
+          PGPASSWORD: ${{ secrets.CI_POSTGRES_ADMIN_PASSWORD }}
+        run: |
+          set -euo pipefail
+
+          psql --host localhost --username hich_dev --dbname hich_erp_test \
+            --no-psqlrc --set ON_ERROR_STOP=1 \
+            --file ../infrastructure/postgres/04_create_test_tenant_fixtures.sql
+
+      - name: Explicitly baseline administrator-provisioned central V1 schemas
+        run: |
+          set -euo pipefail
+          mvn -B -ntp spring-boot:run \
+            -Dspring-boot.run.main-class=com.saaserp.erp.config.CentralSchemaBootstrap \
+            "-Dspring-boot.run.arguments=--baseline-central-v1 hich_erp"
+          mvn -B -ntp spring-boot:run \
+            -Dspring-boot.run.main-class=com.saaserp.erp.config.CentralSchemaBootstrap \
+            "-Dspring-boot.run.arguments=--baseline-central-v1 hich_erp_test"
 
       - name: Build and run tests
         run: mvn -B -ntp clean verify

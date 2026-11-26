@@ -13,13 +13,26 @@ services:
 
     volumes:
       - .:/workspace
+      - maven_cache:/home/vscode/.m2
+      - vscode_cache:/home/vscode/.vscode-server
+      - npm_cache:/home/vscode/.npm
 
     environment:
       DB_HOST: postgres
       DB_PORT: 5432
-      DB_NAME: ${POSTGRES_DB}
-      DB_USER: ${POSTGRES_USER}
-      DB_PASSWORD: ${POSTGRES_PASSWORD}
+      DB_NAME: ${DB_NAME:?Set DB_NAME in .env}
+      DB_RUNTIME_USER: ${DB_RUNTIME_USER:?Set DB_RUNTIME_USER in .env}
+      DB_RUNTIME_PASSWORD: ${DB_RUNTIME_PASSWORD:?Set DB_RUNTIME_PASSWORD in .env}
+      DB_MIGRATION_USER: ${DB_MIGRATION_USER:?Set DB_MIGRATION_USER in .env}
+      DB_MIGRATION_PASSWORD: ${DB_MIGRATION_PASSWORD:?Set DB_MIGRATION_PASSWORD in .env}
+
+      TEST_DB_HOST: postgres
+      TEST_DB_PORT: 5432
+      TEST_DB_NAME: ${TEST_DB_NAME:?Set TEST_DB_NAME in .env}
+      TEST_DB_RUNTIME_USER: ${TEST_DB_RUNTIME_USER:?Set TEST_DB_RUNTIME_USER in .env}
+      TEST_DB_RUNTIME_PASSWORD: ${TEST_DB_RUNTIME_PASSWORD:?Set TEST_DB_RUNTIME_PASSWORD in .env}
+      TEST_DB_MIGRATION_USER: ${TEST_DB_MIGRATION_USER:?Set TEST_DB_MIGRATION_USER in .env}
+      TEST_DB_MIGRATION_PASSWORD: ${TEST_DB_MIGRATION_PASSWORD:?Set TEST_DB_MIGRATION_PASSWORD in .env}
 
       REDIS_HOST: redis
       REDIS_PORT: 6379
@@ -123,3 +136,15 @@ networks:
 volumes:
   postgres_data:
   redis_data:
+
+  maven_cache:
+    external: true
+    name: saas2_maven_cache
+
+  vscode_cache:
+    external: true
+    name: saas2_vscode_cache
+
+  npm_cache:
+    external: true
+    name: saas2_npm_cache
