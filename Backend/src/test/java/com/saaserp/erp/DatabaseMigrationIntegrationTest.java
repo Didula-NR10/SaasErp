@@ -587,6 +587,32 @@ class DatabaseMigrationIntegrationTest {
                 developmentMigrationPassword, developmentRuntimeUsername, "hich_erp");
     }
 
+    @Test
+    void migrationIdentitiesCannotCreateDatabasesOrInheritRuntimePrivileges() throws SQLException {
+        assertRestrictedMigrationRole(testMigrationUrl, testMigrationUsername, testMigrationPassword);
+        assertRestrictedMigrationRole(developmentMigrationUrl, developmentMigrationUsername,
+                developmentMigrationPassword);
+    }
+
+    private static void assertRestrictedMigrationRole(String url, String user, String password) throws SQLException {
+        try (Connection connection = DriverManager.getConnection(url, user, password);
+                PreparedStatement statement = connection.prepareStatement("""
+                        SELECT current_user = ?::name AND current_user = session_user
+                            AND r.rolcanlogin AND NOT r.rolsuper AND NOT r.rolcreatedb
+                            AND NOT r.rolcreaterole AND NOT r.rolreplication AND NOT r.rolbypassrls
+                            AND NOT r.rolinherit
+                            AND NOT pg_catalog.pg_has_role(current_user, 'hich_runtime', 'MEMBER')
+                        FROM pg_catalog.pg_roles r WHERE r.rolname = current_user
+                        """)) {
+            statement.setQueryTimeout(5);
+            statement.setString(1, user);
+            try (ResultSet rows = statement.executeQuery()) {
+                assertThat(rows.next()).isTrue();
+                assertThat(rows.getBoolean(1)).isTrue();
+            }
+        }
+    }
+
     private static void assertDatabaseCreationDenied(String url, String migrationUser, String migrationPassword,
             String runtimeUser, String database) throws SQLException {
         try (Connection connection = DriverManager.getConnection(url, migrationUser, migrationPassword);
