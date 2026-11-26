@@ -92,9 +92,12 @@ explicit reviewed bootstrap step still fails closed.
 
 ## Exact proposed CI change — human review/apply only
 
-No infrastructure SQL changes are needed. Existing scripts 00–04 already establish
-the required roles, ownership, namespaces, restricted credentials and tenant fixtures.
-They remain unchanged. Do not add database CREATE/TEMP grants or modify the V1 files.
+No infrastructure privilege-policy changes are needed for the central baseline.
+Existing script entry points 00–04 establish the required roles, ownership,
+namespaces, restricted credentials and tenant fixtures. The 01/02 configuration
+wrappers now share a guarded implementation; their policy and CI invocation remain
+unchanged. Follow [Shared Database Configuration](database-configuration-scripts.md)
+for file-based local execution. Do not add database CREATE/TEMP grants or modify V1.
 
 Insert this step in `.github/workflows/backend-ci.yml` after **Install isolated
 tenant routing test fixtures** and before **Build and run tests**. This is a proposal;

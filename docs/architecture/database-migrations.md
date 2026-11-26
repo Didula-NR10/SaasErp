@@ -195,14 +195,52 @@ migration passwords to the values established by the administrator. The
 sample file contains placeholders only.
 
 From Windows PowerShell at the repository root, an administrator can review
-and apply each script to the existing PostgreSQL container without recreating
-it or changing volumes:
+and apply the scripts to the existing PostgreSQL container without recreating it
+or changing volumes. The fixed development/test wrappers now include
+`configure_application_database.sql` using psql's `\ir`. **Do not pipe the wrappers
+with `Get-Content ... | docker exec ... psql`:** stdin does not carry the wrapper's
+file location or its sibling include into the container.
+
+Copy the reviewed directory into a unique container-local temporary directory and
+use `--file`, preserving relative includes. These commands require an interactive
+terminal; psql can prompt for the existing administrator password if needed. No
+password is placed in a command argument or printed:
 
 ```powershell
-Get-Content -Raw .\infrastructure\postgres\00_create_roles.sql | docker exec -i saas2-postgres-1 psql -X -U hich_dev -d postgres -v ON_ERROR_STOP=1
-Get-Content -Raw .\infrastructure\postgres\01_configure_hich_erp.sql | docker exec -i saas2-postgres-1 psql -X -U hich_dev -d hich_erp -v ON_ERROR_STOP=1
-Get-Content -Raw .\infrastructure\postgres\02_configure_hich_erp_test.sql | docker exec -i saas2-postgres-1 psql -X -U hich_dev -d hich_erp_test -v ON_ERROR_STOP=1
+$postgresContainer = @(docker compose ps -q postgres)
+if ($LASTEXITCODE -ne 0 -or $postgresContainer.Count -ne 1 -or [string]::IsNullOrWhiteSpace($postgresContainer[0])) {
+    throw 'Expected exactly one running PostgreSQL service; inspect the existing container first'
+}
+$postgresContainer = $postgresContainer[0].Trim()
+$bootstrapDirectory = '/tmp/hich-bootstrap-' + [guid]::NewGuid().ToString('N')
+docker exec $postgresContainer mkdir -m 700 -- $bootstrapDirectory
+if ($LASTEXITCODE -ne 0) { throw 'Could not create the temporary SQL directory' }
+try {
+    # Copying the directory creates its postgres child inside the existing destination.
+    docker cp .\infrastructure\postgres "${postgresContainer}:$bootstrapDirectory/"
+    if ($LASTEXITCODE -ne 0) { throw 'Could not copy the reviewed PostgreSQL scripts' }
+
+    docker exec -it $postgresContainer psql -X -U hich_dev -d postgres -v ON_ERROR_STOP=1 --file "$bootstrapDirectory/postgres/00_create_roles.sql"
+    if ($LASTEXITCODE -ne 0) { throw 'Cluster role setup failed; stop and review' }
+    docker exec -it $postgresContainer psql -X -U hich_dev -d hich_erp -v ON_ERROR_STOP=1 --file "$bootstrapDirectory/postgres/01_configure_hich_erp.sql"
+    if ($LASTEXITCODE -ne 0) { throw 'Development database setup failed; stop and review' }
+    docker exec -it $postgresContainer psql -X -U hich_dev -d hich_erp_test -v ON_ERROR_STOP=1 --file "$bootstrapDirectory/postgres/02_configure_hich_erp_test.sql"
+    if ($LASTEXITCODE -ne 0) { throw 'Test database setup failed; stop and review' }
+} finally {
+    # Remove only this invocation's randomly named directory of copied SQL files.
+    docker exec $postgresContainer rm -rf -- $bootstrapDirectory
+    if ($LASTEXITCODE -ne 0) { Write-Warning 'Temporary SQL directory cleanup failed; review the path manually' }
+}
 ```
+
+The databases must already exist and remain administrator-owned. This replaces
+only the invocation method, not the setup order or review requirements. Do not
+rerun setup merely because source was refactored. Successful cluster setup and
+each database setup are separate transactions; stop and inspect any failure.
+The existing CI `psql --file ../infrastructure/postgres/01_...sql` and `02_...sql`
+commands remain valid because the checkout contains the sibling shared file.
+See [Shared Database Configuration](database-configuration-scripts.md) for the
+parameter/security review and human verification cases.
 
 These scripts are proposals and are not executed by this task. Review the
 current role memberships, database grants, and ownership assumptions first.
