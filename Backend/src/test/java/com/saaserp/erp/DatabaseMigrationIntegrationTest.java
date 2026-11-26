@@ -15,6 +15,7 @@ import jakarta.persistence.EntityManagerFactory;
 import org.flywaydb.core.Flyway;
 import org.flywaydb.core.api.Location;
 import org.flywaydb.core.api.MigrationInfo;
+import org.flywaydb.core.api.MigrationState;
 import org.junit.jupiter.api.BeforeEach;
 import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.beans.factory.annotation.Qualifier;
@@ -175,6 +176,8 @@ class DatabaseMigrationIntegrationTest {
         assertThat(billingFlyway.getConfiguration().isBaselineOnMigrate()).isFalse();
         assertThat(platformFlyway.getConfiguration().isCleanDisabled()).isTrue();
         assertThat(billingFlyway.getConfiguration().isCleanDisabled()).isTrue();
+        assertThat(platformFlyway.getConfiguration().isCreateSchemas()).isFalse();
+        assertThat(billingFlyway.getConfiguration().isCreateSchemas()).isFalse();
     }
 
     @Test
@@ -549,6 +552,60 @@ class DatabaseMigrationIntegrationTest {
                 templateDatabaseUrl, testMigrationUsername, testMigrationPassword);
         assertDatabaseConnectionDenied(
                 templateDatabaseUrl, developmentMigrationUsername, developmentMigrationPassword);
+    }
+
+    @Test
+    void centralV1HistoryIsEitherPreservedSqlOrExplicitVerifiedBaseline() {
+        for (Flyway flyway : new Flyway[] {platformFlyway, billingFlyway}) {
+            flyway.validate();
+            var v1 = Arrays.stream(flyway.info().applied())
+                    .filter(migration -> migration.getVersion() != null
+                            && "1".equals(migration.getVersion().getVersion()))
+                    .toList();
+            assertThat(v1).hasSize(1);
+            MigrationInfo migration = v1.getFirst();
+            if (migration.getState() == MigrationState.BASELINE) {
+                assertThat(migration.getType().name()).isEqualTo("BASELINE");
+                assertThat(migration.getDescription()).isEqualTo("Administrator-provisioned central schema V1");
+                assertThat(migration.getInstalledBy()).isEqualTo(testMigrationUsername);
+                assertThat(migration.getChecksum()).isNull();
+            } else {
+                assertThat(migration.getState()).isEqualTo(MigrationState.SUCCESS);
+                assertThat(migration.getType().name()).isEqualTo("SQL");
+                assertThat(migration.getChecksum()).isNotNull();
+                // Legacy SQL histories may have the original administrator as installer.
+                assertThat(migration.getInstalledBy()).isNotBlank();
+            }
+        }
+    }
+
+    @Test
+    void bothEnvironmentsDenyDatabaseCreateAndTempToMigratorsAndRuntime() throws SQLException {
+        assertDatabaseCreationDenied(testMigrationUrl, testMigrationUsername, testMigrationPassword,
+                testRuntimeUsername, "hich_erp_test");
+        assertDatabaseCreationDenied(developmentMigrationUrl, developmentMigrationUsername,
+                developmentMigrationPassword, developmentRuntimeUsername, "hich_erp");
+    }
+
+    private static void assertDatabaseCreationDenied(String url, String migrationUser, String migrationPassword,
+            String runtimeUser, String database) throws SQLException {
+        try (Connection connection = DriverManager.getConnection(url, migrationUser, migrationPassword);
+                PreparedStatement statement = connection.prepareStatement("""
+                        SELECT current_user = ?::name AND current_user = session_user
+                            AND pg_catalog.current_database() = ?::name
+                            AND pg_catalog.pg_get_userbyid(d.datdba) = 'hich_dev'
+                            AND NOT pg_catalog.has_database_privilege(current_user, d.datname::text, 'CREATE,TEMP')
+                            AND NOT pg_catalog.has_database_privilege(?::name, d.datname::text, 'CREATE,TEMP')
+                        FROM pg_catalog.pg_database d WHERE d.datname = pg_catalog.current_database()
+                        """)) {
+            statement.setString(1, migrationUser);
+            statement.setString(2, database);
+            statement.setString(3, runtimeUser);
+            try (ResultSet rows = statement.executeQuery()) {
+                assertThat(rows.next()).isTrue();
+                assertThat(rows.getBoolean(1)).isTrue();
+            }
+        }
     }
 
     private boolean schemaAndHistoryExist(String schema) {

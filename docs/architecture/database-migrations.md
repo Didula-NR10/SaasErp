@@ -163,14 +163,18 @@ migrator; unexpected ownership is a fail-fast condition for manual review.
 development environment. It is not suitable as a production runtime identity.
 No database roles or grants have been changed by application startup.
 
-The existing V1 migrations contain `CREATE SCHEMA IF NOT EXISTS`. The
-administrator bootstrap scripts create and transfer `platform` and `billing`
-before the application starts; the migration roles do not receive permanent
-database-level `CREATE`. When the schemas already exist, the V1 statements
-are no-ops. If a schema is missing, startup must fail rather than grant
-temporary or permanent schema-creation authority to the application. This is
-a controlled administrator bootstrap prerequisite, not a Flyway privilege
-fallback.
+The immutable V1 migrations contain `CREATE SCHEMA IF NOT EXISTS`. PostgreSQL
+checks database CREATE permission even when these schemas already exist, so
+restricted migrators cannot execute V1 in a fresh history. The earlier assumption
+that these statements were safe no-ops under restricted permissions was incorrect.
+Administrator scripts still create and transfer both schemas without granting
+database CREATE/TEMP to migrators or runtime accounts. Fresh environments require
+the explicit, verified version-1 bootstrap described in
+[Central Schema V1 Bootstrap Compatibility](central-schema-bootstrap.md).
+Existing SQL V1 histories/checksums are preserved. `FlywayConfig` continues to use
+`baselineOnMigrate(false)` and `createSchemas(false)`; normal startup does not
+baseline or repair any history. Missing or unexpected prerequisite state fails
+closed instead of granting schema-creation authority.
 
 `postgres` and `template1` are outside the application's access boundary.
 The cluster script removes `PUBLIC` and restricted-role database privileges

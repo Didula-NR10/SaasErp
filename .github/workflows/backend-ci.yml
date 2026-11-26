@@ -151,5 +151,15 @@ jobs:
             --no-psqlrc --set ON_ERROR_STOP=1 \
             --file ../infrastructure/postgres/04_create_test_tenant_fixtures.sql
 
+      - name: Explicitly baseline administrator-provisioned central V1 schemas
+        run: |
+          set -euo pipefail
+          mvn -B -ntp spring-boot:run \
+            -Dspring-boot.run.main-class=com.saaserp.erp.config.CentralSchemaBootstrap \
+            "-Dspring-boot.run.arguments=--baseline-central-v1 hich_erp"
+          mvn -B -ntp spring-boot:run \
+            -Dspring-boot.run.main-class=com.saaserp.erp.config.CentralSchemaBootstrap \
+            "-Dspring-boot.run.arguments=--baseline-central-v1 hich_erp_test"
+
       - name: Build and run tests
         run: mvn -B -ntp clean verify
