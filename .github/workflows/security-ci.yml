@@ -84,6 +84,9 @@ jobs:
           cache: maven
           cache-dependency-path: Backend/pom.xml
 
+      - name: Verify packaged scan security guards
+        run: node --test .github/scripts/security-ci.test.mjs
+
       # Populate the local Maven repository
 
       - name: Resolve Maven dependencies
@@ -174,67 +177,4 @@ jobs:
 
       - name: Scan packaged Spring Boot JAR and require complete Java inventory
         if: ${{ !cancelled() && steps.package-backend.outcome == 'success' && steps.trivy-db.outcome == 'success' }}
-        run: |
-          set -euo pipefail
-          shopt -s nullglob
-          jars=(Backend/target/*.jar)
-          if [[ ${#jars[@]} -ne 1 ]]; then
-            echo "::error::Expected exactly one packaged backend JAR"
-            exit 1
-          fi
-          report="$RUNNER_TEMP/trivy-backend-jar.json"
-
-          # No ignore file, unfixed exclusion, or repository-supplied Trivy config.
-          # Retain and return Trivy's failure after validating/reporting the inventory.
-          scan_status=0
-          trivy fs \
-            --config '' \
-            --ignorefile '' \
-            --ignore-unfixed=false \
-            --scanners vuln \
-            --severity HIGH,CRITICAL \
-            --exit-code 1 \
-            --list-all-pkgs \
-            --format json \
-            --output "$report" \
-            "${jars[0]}" || scan_status=$?
-
-          python3 - "${jars[0]}" "$report" <<'PY_INVENTORY'
-          import json
-          import sys
-          import zipfile
-
-          jar_path, report_path = sys.argv[1:]
-          with zipfile.ZipFile(jar_path) as archive:
-              entries = archive.namelist()
-          expected = {
-              name for name in entries
-              if name.startswith("BOOT-INF/lib/") and name.endswith(".jar")
-          }
-          if not expected or not any(
-              name.startswith("BOOT-INF/classes/") and name.endswith(".class")
-              for name in entries
-          ):
-              sys.exit("Expected compiled application classes and embedded Spring Boot libraries")
-
-          with open(report_path, encoding="utf-8") as stream:
-              report = json.load(stream)
-          identified = set()
-          for result in report.get("Results", []):
-              for finding in result.get("Vulnerabilities", []):
-                  print(f"{finding['Severity']}: {finding['VulnerabilityID']} "
-                        f"{finding['PkgName']} {finding['InstalledVersion']}")
-              if result.get("Type") != "jar":
-                  continue
-              for package in result.get("Packages", []):
-                  path = package.get("FilePath", "")
-                  marker = "BOOT-INF/lib/"
-                  if (marker in path and package.get("Name") and package.get("Version")
-                          and package.get("Identifier", {}).get("PURL", "").startswith("pkg:maven/")):
-                      identified.add(marker + path.split(marker, 1)[1])
-          missing = expected - identified
-          if missing:
-              sys.exit("Trivy did not identify every embedded Java dependency:\n" + "\n".join(sorted(missing)))
-          print(f"Trivy identified all {len(expected)} embedded Java dependency JARs")
-          PY_INVENTORY
-          exit "$scan_status"
+        run: node .github/scripts/scan-boot-jar.mjs Backend/target "$RUNNER_TEMP"
