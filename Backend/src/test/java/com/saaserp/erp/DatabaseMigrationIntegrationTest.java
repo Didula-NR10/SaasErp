@@ -507,11 +507,115 @@ class DatabaseMigrationIntegrationTest {
     @Test
     void runtimeCannotCreateRolesOrModifyFlywayHistory() {
         assertPermissionDenied("CREATE ROLE runtime_role_denied LOGIN");
+        assertThat(jdbcTemplate.queryForObject(
+                "SELECT has_table_privilege(current_user, 'platform.company_memberships', 'UPDATE')",
+                Boolean.class)).isFalse();
+        assertThat(jdbcTemplate.queryForObject(
+                "SELECT has_function_privilege(current_user, "
+                        + "'platform.lock_mfa_transaction_state(uuid,text,text)', 'EXECUTE')",
+                Boolean.class)).isTrue();
         assertPermissionDenied(
                 "UPDATE platform.flyway_schema_history SET success = success WHERE version = '1'");
         assertPermissionDenied(
                 "UPDATE platform.privilege_test_schema_history "
                         + "SET success = success WHERE version = '1'");
+    }
+
+    @Test
+    void runtimeCannotMutateAuthorizationWorkflowsOrAuditTablesDirectly() {
+        assertThat(jdbcTemplate.queryForObject(
+                "SELECT has_table_privilege(current_user, 'platform.platform_administrator_sessions', 'SELECT')",
+                Boolean.class)).isFalse();
+        assertThat(jdbcTemplate.queryForObject(
+                "SELECT has_table_privilege(current_user, 'platform.platform_administrator_sessions', 'INSERT')",
+                Boolean.class)).isFalse();
+        assertThat(jdbcTemplate.queryForObject(
+                "SELECT has_table_privilege(current_user, 'platform.platform_administrator_sessions', 'UPDATE')",
+                Boolean.class)).isFalse();
+        assertThat(jdbcTemplate.queryForObject(
+                "SELECT has_table_privilege(current_user, 'platform.platform_account_roles', 'UPDATE')",
+                Boolean.class)).isFalse();
+        assertThat(jdbcTemplate.queryForObject(
+                "SELECT has_function_privilege(current_user, "
+                        + "'platform.authorize_platform_session(uuid,uuid,text,text,text)', 'EXECUTE')",
+                Boolean.class)).isTrue();
+        assertThat(jdbcTemplate.queryForObject(
+                "SELECT has_function_privilege(current_user, "
+                        + "'platform.assign_company_role(uuid,uuid,uuid,text,uuid,text,text,uuid,text,uuid)', 'EXECUTE')",
+                Boolean.class)).isTrue();
+        assertThat(jdbcTemplate.queryForObject(
+                "SELECT has_table_privilege(current_user, 'platform.authorization_role_permissions', 'UPDATE')",
+                Boolean.class)).isFalse();
+        assertThat(jdbcTemplate.queryForObject(
+                "SELECT has_table_privilege(current_user, 'platform.step_up_authorizations', 'INSERT')",
+                Boolean.class)).isFalse();
+        assertThat(jdbcTemplate.queryForObject(
+                "SELECT has_table_privilege(current_user, 'platform.step_up_authorizations', 'UPDATE')",
+                Boolean.class)).isFalse();
+        assertThat(jdbcTemplate.queryForObject(
+                "SELECT has_table_privilege(current_user, 'platform.dual_approvals', 'INSERT')",
+                Boolean.class)).isFalse();
+        assertThat(jdbcTemplate.queryForObject(
+                "SELECT has_table_privilege(current_user, 'platform.dual_approvals', 'UPDATE')",
+                Boolean.class)).isFalse();
+        assertThat(jdbcTemplate.queryForObject(
+                "SELECT has_table_privilege(current_user, 'platform.security_audit_events', 'INSERT')",
+                Boolean.class)).isFalse();
+        assertThat(jdbcTemplate.queryForObject(
+                "SELECT has_table_privilege(current_user, 'platform.security_audit_events', 'DELETE')",
+                Boolean.class)).isFalse();
+        assertThat(jdbcTemplate.queryForObject(
+                "SELECT has_function_privilege(current_user, "
+                        + "'platform.authorize_company_session(uuid,uuid,uuid,text,text)', 'EXECUTE')",
+                Boolean.class)).isTrue();
+        assertThat(jdbcTemplate.queryForObject(
+                "SELECT has_function_privilege(current_user, "
+                        + "'platform.create_step_up_authorization(uuid,uuid,uuid,uuid,text,text,text,text,text,text,uuid)', 'EXECUTE')",
+                Boolean.class)).isTrue();
+        assertThat(jdbcTemplate.queryForObject(
+                "SELECT has_function_privilege(current_user, "
+                        + "'platform.create_dual_approval(uuid,uuid,text,uuid,uuid,text,text,text,text,text,uuid,uuid)', 'EXECUTE')",
+                Boolean.class)).isTrue();
+        assertThat(jdbcTemplate.queryForObject(
+                "SELECT to_regprocedure('platform.cancel_dual_approval(uuid,uuid,uuid,uuid,text)') IS NOT NULL",
+                Boolean.class)).isFalse();
+        assertThat(jdbcTemplate.queryForObject(
+                "SELECT has_function_privilege(current_user, "
+                        + "'platform.cancel_dual_approval(uuid,uuid,uuid,uuid,text,uuid)', 'EXECUTE')",
+                Boolean.class)).isTrue();
+        assertThat(jdbcTemplate.queryForObject(
+                "SELECT to_regprocedure('platform.consume_dual_approval(uuid,uuid,uuid,uuid,text,text,text,text,text)') IS NOT NULL",
+                Boolean.class)).isFalse();
+    }
+
+    @Test
+    void obsoleteAuthorizationOverloadsAreAbsentAndV9KeepsLeastPrivilege() {
+        assertExpectedMigrationApplied(platformFlyway, "9");
+        for (String signature : List.of(
+                "consume_dual_approval(uuid,uuid,uuid,uuid,text,text,text,text,text)",
+                "cancel_dual_approval(uuid,uuid,uuid,uuid,text)",
+                "expire_dual_approval(uuid)")) {
+            assertThat(jdbcTemplate.queryForObject("SELECT to_regprocedure(?) IS NULL",
+                    Boolean.class, "platform." + signature)).isTrue();
+        }
+        assertThat(jdbcTemplate.queryForObject("""
+                SELECT has_function_privilege(current_user,
+                    'platform.company_role_operation_digest(uuid,uuid,text,text)', 'EXECUTE')
+                """, Boolean.class)).isFalse();
+        assertPermissionDenied("SELECT platform.company_role_operation_digest(gen_random_uuid(),gen_random_uuid(),'EMPLOYEE','OWNER')");
+        assertThat(jdbcTemplate.queryForObject("""
+                SELECT has_function_privilege(current_user,
+                    'platform.consume_dual_approval(uuid,uuid,uuid,uuid,text,text,text,text,text,uuid)', 'EXECUTE')
+                """, Boolean.class)).isTrue();
+        assertThat(jdbcTemplate.queryForObject("""
+                SELECT count(*) FROM pg_proc p JOIN pg_namespace n ON n.oid=p.pronamespace
+                CROSS JOIN LATERAL aclexplode(coalesce(p.proacl,acldefault('f',p.proowner))) acl
+                WHERE n.nspname='platform' AND p.proname IN (
+                    'company_role_operation_digest','assign_company_role','consume_dual_approval',
+                    'approve_dual_approval','cancel_dual_approval','expire_dual_approval',
+                    'create_dual_approval','create_step_up_authorization')
+                AND acl.grantee=0 AND acl.privilege_type='EXECUTE'
+                """, Long.class)).isZero();
     }
 
     @Test

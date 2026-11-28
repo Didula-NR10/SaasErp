@@ -65,7 +65,7 @@ jobs:
   vulnerability-scan:
     name: Trivy Vulnerability Scan
     runs-on: ubuntu-latest
-    timeout-minutes: 15
+    timeout-minutes: 30
 
     steps:
 
@@ -105,9 +105,45 @@ jobs:
 
           trivy --version
 
+      # Cache only databases, never scan results. Every run still checks for updates.
+
+      - name: Configure Trivy cache
+        id: trivy-cache
+        run: |
+          echo "TRIVY_CACHE_DIR=$RUNNER_TEMP/trivy-cache" >> "$GITHUB_ENV"
+          echo "date=$(date -u +%F)" >> "$GITHUB_OUTPUT"
+
+      - name: Restore Trivy databases
+        id: trivy-db-cache
+        uses: actions/cache/restore@v4
+        with:
+          path: |
+            ${{ runner.temp }}/trivy-cache/db
+            ${{ runner.temp }}/trivy-cache/java-db
+          key: trivy-db-${{ runner.os }}-0.76.2-${{ steps.trivy-cache.outputs.date }}
+          restore-keys: |
+            trivy-db-${{ runner.os }}-0.76.2-
+
+      - name: Update Trivy vulnerability and Java databases
+        id: trivy-db
+        run: |
+          set -euo pipefail
+          trivy fs --download-db-only --no-progress
+          trivy fs --download-java-db-only --no-progress
+
+      - name: Save updated Trivy databases
+        if: ${{ steps.trivy-db-cache.outputs.cache-hit != 'true' }}
+        uses: actions/cache/save@v4
+        with:
+          path: |
+            ${{ runner.temp }}/trivy-cache/db
+            ${{ runner.temp }}/trivy-cache/java-db
+          key: ${{ steps.trivy-db-cache.outputs.cache-primary-key }}
+
       # Scan third-party dependencies
 
       - name: Scan dependency vulnerabilities
+        if: ${{ !cancelled() }}
         run: |
           trivy fs \
             --scanners vuln \
@@ -119,9 +155,86 @@ jobs:
       # Scan infrastructure configurations
 
       - name: Scan infrastructure configuration
+        if: ${{ !cancelled() }}
         run: |
           trivy config \
             --severity HIGH,CRITICAL \
             --exit-code 1 \
             --format table \
             .
+
+      # This packaging pass does not replace Backend CI's clean verify/test/ArchUnit gate.
+      # Reuse setup-java's existing Maven cache; do not force dependency updates with -U.
+
+      - name: Package backend for dependency scanning
+        id: package-backend
+        if: ${{ !cancelled() }}
+        working-directory: Backend
+        run: mvn -B -ntp -DskipTests package
+
+      - name: Scan packaged Spring Boot JAR and require complete Java inventory
+        if: ${{ !cancelled() && steps.package-backend.outcome == 'success' && steps.trivy-db.outcome == 'success' }}
+        run: |
+          set -euo pipefail
+          shopt -s nullglob
+          jars=(Backend/target/*.jar)
+          if [[ ${#jars[@]} -ne 1 ]]; then
+            echo "::error::Expected exactly one packaged backend JAR"
+            exit 1
+          fi
+          report="$RUNNER_TEMP/trivy-backend-jar.json"
+
+          # No ignore file, unfixed exclusion, or repository-supplied Trivy config.
+          # Retain and return Trivy's failure after validating/reporting the inventory.
+          scan_status=0
+          trivy fs \
+            --config '' \
+            --ignorefile '' \
+            --ignore-unfixed=false \
+            --scanners vuln \
+            --severity HIGH,CRITICAL \
+            --exit-code 1 \
+            --list-all-pkgs \
+            --format json \
+            --output "$report" \
+            "${jars[0]}" || scan_status=$?
+
+          python3 - "${jars[0]}" "$report" <<'PY_INVENTORY'
+          import json
+          import sys
+          import zipfile
+
+          jar_path, report_path = sys.argv[1:]
+          with zipfile.ZipFile(jar_path) as archive:
+              entries = archive.namelist()
+          expected = {
+              name for name in entries
+              if name.startswith("BOOT-INF/lib/") and name.endswith(".jar")
+          }
+          if not expected or not any(
+              name.startswith("BOOT-INF/classes/") and name.endswith(".class")
+              for name in entries
+          ):
+              sys.exit("Expected compiled application classes and embedded Spring Boot libraries")
+
+          with open(report_path, encoding="utf-8") as stream:
+              report = json.load(stream)
+          identified = set()
+          for result in report.get("Results", []):
+              for finding in result.get("Vulnerabilities", []):
+                  print(f"{finding['Severity']}: {finding['VulnerabilityID']} "
+                        f"{finding['PkgName']} {finding['InstalledVersion']}")
+              if result.get("Type") != "jar":
+                  continue
+              for package in result.get("Packages", []):
+                  path = package.get("FilePath", "")
+                  marker = "BOOT-INF/lib/"
+                  if (marker in path and package.get("Name") and package.get("Version")
+                          and package.get("Identifier", {}).get("PURL", "").startswith("pkg:maven/")):
+                      identified.add(marker + path.split(marker, 1)[1])
+          missing = expected - identified
+          if missing:
+              sys.exit("Trivy did not identify every embedded Java dependency:\n" + "\n".join(sorted(missing)))
+          print(f"Trivy identified all {len(expected)} embedded Java dependency JARs")
+          PY_INVENTORY
+          exit "$scan_status"
