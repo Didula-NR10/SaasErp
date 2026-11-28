@@ -183,12 +183,14 @@ process.exit(Number(process.env.TEST_SCAN_STATUS));
   });
   return { ...result, args: JSON.parse(readFileSync(argsFile, 'utf8')) };
 }
-test('pipeline scans extracted files with mandatory unfiltered vulnerability flags', () => {
+test('pipeline uses rootfs rather than fs for extracted JARs with library vulnerability scanning', () => {
   const result = runMockScan(JSON.stringify(complete()), 0);
   assert.equal(result.status, 0, result.stderr);
+  assert.equal(result.args[0], 'rootfs');
+  assert.ok(!result.args.includes('fs'));
   assert.deepEqual(result.args.slice(0, -3), SCAN_FLAGS);
   for (const [flag, value] of [['--config', ''], ['--ignorefile', ''], ['--scanners', 'vuln'],
-    ['--severity', 'HIGH,CRITICAL'], ['--exit-code', '1'], ['--format', 'json']]) {
+    ['--pkg-types', 'library'], ['--severity', 'HIGH,CRITICAL'], ['--exit-code', '1'], ['--format', 'json']]) {
     assert.equal(result.args[result.args.indexOf(flag) + 1], value, flag);
   }
   assert.ok(result.args.includes('--ignore-unfixed=false'));

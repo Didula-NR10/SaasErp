@@ -7,8 +7,9 @@ import { constants } from 'node:os';
 // Verified against Trivy v0.76.2's versioned CLI, jar parser, language analyzer
 // and JSON structs; see docs/security/phase04-ci-security-correction.md.
 export const SCAN_FLAGS = [
-  'fs', '--config', '', '--ignorefile', '', '--ignore-unfixed=false',
-  '--scanners', 'vuln', '--severity', 'HIGH,CRITICAL', '--exit-code', '1',
+  // v0.76.2 filesystem mode disables individual package analyzers, including JARs.
+  'rootfs', '--config', '', '--ignorefile', '', '--ignore-unfixed=false',
+  '--scanners', 'vuln', '--pkg-types', 'library', '--severity', 'HIGH,CRITICAL', '--exit-code', '1',
   '--list-all-pkgs', '--format', 'json',
 ];
 const libraryPath = /^BOOT-INF\/lib\/[A-Za-z0-9][A-Za-z0-9._+\-]*\.jar$/;
