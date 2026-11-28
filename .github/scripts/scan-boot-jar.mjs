@@ -1,5 +1,5 @@
-import { readFileSync, mkdtempSync, statSync } from 'node:fs';
-import { join, resolve } from 'node:path';
+import { accessSync, constants as fsConstants, lstatSync, mkdirSync, readFileSync, realpathSync, mkdtempSync, statSync } from 'node:fs';
+import { dirname, isAbsolute, join, normalize, relative, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { spawnSync } from 'node:child_process';
 import { constants } from 'node:os';
@@ -76,14 +76,108 @@ function statusOf(child) {
   return child.status ?? (128 + (constants.signals[child.signal] ?? 0));
 }
 
-export function scanBootJar(target, runnerTemp) {
-  requireValue(target && runnerTemp, 'Expected target directory and RUNNER_TEMP');
-  const work = mkdtempSync(join(resolve(runnerTemp), 'trivy-backend-'));
+const repositoryRoot = fileURLToPath(new URL('../../', import.meta.url));
+const installedTools = Object.freeze({ javaCache: '/opt/hostedtoolcache', trivy: '/usr/local/bin/trivy' });
+
+function canonicalPath(value) {
+  requireValue(typeof value === 'string' && /^\/[A-Za-z0-9_./+\-]+$/.test(value)
+    && isAbsolute(value) && normalize(value) === value
+    && !value.split('/').some(part => part === '.' || part === '..'), 'Unsafe or noncanonical CI path');
+  requireValue(realpathSync(value) === value, 'Symbolic links are not permitted in CI paths');
+  return value;
+}
+
+function requireContained(root, path) {
+  const suffix = relative(root, path);
+  requireValue(suffix !== '' && !suffix.startsWith('..') && !isAbsolute(suffix), 'CI path is outside its trusted root');
+  return path;
+}
+
+function directory(path) {
+  canonicalPath(path);
+  const info = lstatSync(path);
+  requireValue(info.isDirectory(), 'Expected a real CI directory');
+  return path;
+}
+
+function ownedPath(path) {
+  const info = lstatSync(path);
+  requireValue(info.uid === 0 || info.uid === process.getuid(), 'CI path has unsafe ownership');
+  return path;
+}
+
+function protectedPath(path) {
+  ownedPath(path);
+  requireValue((lstatSync(path).mode & 0o022) === 0, 'CI path has unsafe ownership or write permissions');
+  return path;
+}
+
+function protectedDirectoryTree(root, path) {
+  directory(root);
+  requireContained(root, path);
+  let current = root;
+  for (const part of relative(root, path).split('/')) {
+    current = join(current, part);
+    protectedPath(directory(current));
+  }
+  return current;
+}
+
+export function validateExecutable(path, root) {
+  protectedPath(directory(root));
+  requireContained(root, canonicalPath(path));
+  const parent = dirname(path);
+  if (parent !== root) protectedDirectoryTree(root, parent);
+  const info = lstatSync(path);
+  requireValue(info.isFile() && info.size > 0, 'Expected a nonempty regular CI executable');
+  protectedPath(path);
+  accessSync(path, fsConstants.X_OK);
+  return path;
+}
+
+// Provisioning overrides are used only by in-process tests. The CLI accepts no
+// paths or tool overrides; production always uses the fixed installations above.
+export function createScanContext(repo, ci, provisioning = installedTools) {
+  repo = directory(repo);
+  const target = directory(requireContained(repo, join(repo, 'Backend', 'target')));
+  const extractor = canonicalPath(requireContained(repo, join(repo, '.github', 'scripts', 'PrepareBootScan.java')));
+  requireValue(lstatSync(extractor).isFile(), 'Expected the checked-in archive extractor');
+
+  // actions/checkout's default layout on this ubuntu-latest job:
+  // <work>/<repository>/<repository>, with runner.temp at <work>/_temp.
+  const runnerTemp = protectedPath(directory(join(dirname(dirname(repo)), '_temp')));
+  requireValue(ci.RUNNER_TEMP === runnerTemp, 'Unexpected RUNNER_TEMP for the checked-out repository');
+  const cache = protectedPath(directory(requireContained(runnerTemp, join(runnerTemp, 'trivy-cache'))));
+  requireValue(ci.TRIVY_CACHE_DIR === cache, 'Unexpected Trivy cache directory');
+
+  // The hosted image intentionally makes the tool-cache container writable.
+  // Trust its fixed CI location/owner, but require protected JDK descendants.
+  const javaCache = ownedPath(directory(provisioning.javaCache));
+  const javaHome = protectedDirectoryTree(javaCache, canonicalPath(ci.JAVA_HOME));
+  requireValue(/^Java_Temurin-Hotspot_jdk\/21\.[A-Za-z0-9.+_-]+\/x64$/.test(relative(javaCache, javaHome)),
+    'Expected the CI-provisioned Temurin 21 x64 JDK');
+  const java = validateExecutable(join(javaHome, 'bin', 'java'), javaHome);
+  validateExecutable(provisioning.trivy, protectedPath(directory(dirname(provisioning.trivy))));
+  return Object.freeze({ repo, target, extractor, runnerTemp, cache, java, javaHome });
+}
+
+export function scanBootJar(context, runProcess = spawnSync) {
+  const work = mkdtempSync(join(context.runnerTemp, 'trivy-backend-'));
+  protectedPath(directory(requireContained(context.runnerTemp, work)));
   const scan = join(work, 'scan'), inventory = join(work, 'expected.txt'), report = join(work, 'report.json');
-  const extractor = fileURLToPath(new URL('./PrepareBootScan.java', import.meta.url));
-  const prepareStatus = statusOf(spawnSync('java', [extractor, resolve(target), scan, inventory], { stdio: 'inherit' }));
+  const home = join(work, 'home'), temp = join(work, 'tmp');
+  mkdirSync(home, { mode: 0o700 });
+  mkdirSync(temp, { mode: 0o700 });
+  // Deliberate allowlist: no PATH, loader/JVM injection, credentials, or inherited
+  // TRIVY_* options that could suppress findings. Retain the validated DB cache.
+  const baseEnv = { HOME: home, TMPDIR: temp, LANG: 'C.UTF-8', LC_ALL: 'C.UTF-8' };
+  const prepareStatus = statusOf(runProcess(context.java, [context.extractor, context.target, scan, inventory], {
+    cwd: context.repo, shell: false, stdio: 'inherit', env: { ...baseEnv, JAVA_HOME: context.javaHome },
+  }));
   if (prepareStatus !== 0) return prepareStatus;
-  const scanStatus = statusOf(spawnSync('trivy', [...SCAN_FLAGS, '--output', report, scan], { stdio: 'inherit' }));
+  const scanStatus = statusOf(runProcess('/usr/local/bin/trivy', [...SCAN_FLAGS, '--output', report, scan], {
+    cwd: context.repo, shell: false, stdio: 'inherit', env: { ...baseEnv, TRIVY_CACHE_DIR: context.cache },
+  }));
   let validationStatus = 0;
   try {
     requireValue(statSync(report).size > 0 && statSync(report).size <= 64 * 1024 * 1024, 'Empty or oversized Trivy report');
@@ -101,8 +195,8 @@ export function scanBootJar(target, runnerTemp) {
 
 if (process.argv[1] && resolve(process.argv[1]) === fileURLToPath(import.meta.url)) {
   try {
-    requireValue(process.argv.length === 4, 'Usage: node scan-boot-jar.mjs TARGET_DIRECTORY RUNNER_TEMP');
-    process.exitCode = scanBootJar(process.argv[2], process.argv[3]);
+    requireValue(process.argv.length === 2, 'The artifact scanner accepts no command-line arguments');
+    process.exitCode = scanBootJar(createScanContext(repositoryRoot.replace(/\/$/, ''), process.env));
   } catch (error) {
     console.error(error.message);
     process.exitCode = 1;

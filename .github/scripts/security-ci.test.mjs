@@ -1,15 +1,18 @@
 import test, { before, after } from 'node:test';
 import assert from 'node:assert/strict';
-import { mkdtempSync, mkdirSync, writeFileSync, readFileSync, readdirSync, rmSync, symlinkSync } from 'node:fs';
+import { mkdtempSync, mkdirSync, writeFileSync, readFileSync, readdirSync, rmSync, symlinkSync, realpathSync, chmodSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join, resolve } from 'node:path';
 import { spawnSync } from 'node:child_process';
 import { deflateRawSync } from 'node:zlib';
-import { SCAN_FLAGS, validateInventory } from './scan-boot-jar.mjs';
+import { SCAN_FLAGS, createScanContext, scanBootJar, validateExecutable, validateInventory } from './scan-boot-jar.mjs';
 
 const root = mkdtempSync(join(tmpdir(), 'security-ci-test-'));
 const classes = join(root, 'helper-classes');
 const extractor = resolve('.github/scripts/PrepareBootScan.java');
+const testJdk = realpathSync(process.env.JAVA_HOME);
+const testJava = join(testJdk, 'bin', 'java');
+const testJavac = join(testJdk, 'bin', 'javac');
 const launcher = 'org/springframework/boot/loader/launch/JarLauncher.class';
 const application = 'BOOT-INF/classes/com/saaserp/erp/ErpApplication.class';
 const libA = 'BOOT-INF/lib/alpha-1.0.jar', libB = 'BOOT-INF/lib/beta-2.0.jar';
@@ -53,14 +56,23 @@ function bootEntries() {
     ['BOOT-INF/lib/', ''], [libA, dependency], [libB, dependency, 8]];
 }
 function fixture(entries = bootEntries()) {
-  const work = mkdtempSync(join(root, 'case-')), target = join(work, 'target');
-  mkdirSync(target);
+  const work = mkdtempSync(join(root, 'case-')), repo = join(work, 'work', 'project', 'project');
+  const target = join(repo, 'Backend', 'target'), runnerTemp = join(work, 'work', '_temp');
+  const cache = join(runnerTemp, 'trivy-cache'), javaCache = join(work, 'toolcache');
+  const javaHome = join(javaCache, 'Java_Temurin-Hotspot_jdk', '21.0.13-11', 'x64');
+  const java = join(javaHome, 'bin', 'java'), trivy = join(work, 'install', 'bin', 'trivy');
+  for (const dir of [target, cache, join(repo, '.github', 'scripts'), join(javaHome, 'bin'), join(work, 'install', 'bin')]) {
+    mkdirSync(dir, { recursive: true });
+  }
+  writeFileSync(join(repo, '.github', 'scripts', 'PrepareBootScan.java'), readFileSync(extractor));
+  for (const file of [java, trivy]) writeFileSync(file, 'fixture executable; never executed', { mode: 0o755 });
   const jar = join(target, 'erp.jar');
   writeFileSync(jar, zip(entries));
-  return { work, target, jar, scan: join(work, 'scan'), inventory: join(work, 'expected.txt') };
+  return { work, repo, runnerTemp, cache, javaCache, javaHome, java, trivy, target, jar,
+    scan: join(work, 'scan'), inventory: join(work, 'expected.txt') };
 }
 function prepare(f) {
-  return spawnSync('java', ['-cp', classes, 'PrepareBootScan', f.target, f.scan, f.inventory], { encoding: 'utf8' });
+  return spawnSync(testJava, ['-cp', classes, 'PrepareBootScan', f.target, f.scan, f.inventory], { encoding: 'utf8' });
 }
 function pkg(path, group, name, version) {
   return { FilePath: path, Name: `${group}:${name}`, Version: version,
@@ -73,7 +85,7 @@ function complete() {
 
 before(() => {
   mkdirSync(classes);
-  const compiled = spawnSync('javac', ['-d', classes, extractor], { encoding: 'utf8' });
+  const compiled = spawnSync(testJavac, ['-d', classes, extractor], { encoding: 'utf8' });
   assert.equal(compiled.status, 0, compiled.stderr);
 });
 after(() => rmSync(root, { recursive: true, force: true }));
@@ -161,28 +173,31 @@ test('rejects preexisting destinations and symlink application artifacts', () =>
   assert.notEqual(prepare(other).status, 0);
 });
 
+function contextFor(f, overrides = {}) {
+  return createScanContext(f.repo, { RUNNER_TEMP: f.runnerTemp, TRIVY_CACHE_DIR: f.cache,
+    JAVA_HOME: f.javaHome, ...overrides }, { javaCache: f.javaCache, trivy: f.trivy });
+}
+
 function runMockScan(report, scannerStatus, options = {}) {
-  const f = fixture(), bin = join(f.work, 'bin'); mkdirSync(bin);
-  // Reuse the compiled CI-only extractor in these subprocess tests.
-  writeFileSync(join(bin, 'java'), '#!/bin/sh\nshift\nexec "$REAL_TEST_JAVA" -cp "$TEST_HELPER_CLASSES" PrepareBootScan "$@"\n', { mode: 0o755 });
-  writeFileSync(join(bin, 'trivy'), `#!/usr/bin/env node
-const fs = require('node:fs');
-const args = process.argv.slice(2);
-fs.writeFileSync(process.env.TEST_ARGS, JSON.stringify(args));
-if (process.env.TEST_NO_REPORT !== 'true') {
-  fs.writeFileSync(args[args.indexOf('--output') + 1], process.env.TEST_REPORT);
-}
-process.exit(Number(process.env.TEST_SCAN_STATUS));
-`, { mode: 0o755 });
-  const realJava = spawnSync('which', ['java'], { encoding: 'utf8' }).stdout.trim();
-  const argsFile = join(f.work, 'arguments.json');
-  const result = spawnSync(process.execPath, [resolve('.github/scripts/scan-boot-jar.mjs'), f.target, f.work], {
-    encoding: 'utf8', env: { ...process.env, PATH: `${bin}:${process.env.PATH}`, REAL_TEST_JAVA: realJava,
-      TEST_HELPER_CLASSES: classes, TEST_ARGS: argsFile, TEST_REPORT: report,
-      TEST_SCAN_STATUS: String(scannerStatus), TEST_NO_REPORT: String(Boolean(options.noReport)) },
+  const f = fixture(), context = contextFor(f, options.ci);
+  const calls = [];
+  const status = scanBootJar(context, (executable, args, processOptions) => {
+    calls.push({ executable, args, processOptions });
+    if (calls.length === 1) {
+      assert.equal(executable, f.java);
+      // Execute the real CI extractor, compiled once for the test suite; no PATH
+      // wrappers or production environment overrides are needed to mock Trivy.
+      return spawnSync(testJava, ['-cp', classes, 'PrepareBootScan', ...args.slice(1)], {
+        ...processOptions, stdio: 'pipe', encoding: 'utf8',
+      });
+    }
+    assert.equal(executable, '/usr/local/bin/trivy');
+    if (!options.noReport) writeFileSync(args[args.indexOf('--output') + 1], report);
+    return { status: scannerStatus, signal: options.signal ?? null };
   });
-  return { ...result, args: JSON.parse(readFileSync(argsFile, 'utf8')) };
+  return { status, args: calls[1].args, calls, fixture: f };
 }
+
 test('pipeline uses rootfs rather than fs for extracted JARs with library vulnerability scanning', () => {
   const result = runMockScan(JSON.stringify(complete()), 0);
   assert.equal(result.status, 0, result.stderr);
@@ -217,6 +232,139 @@ test('pipeline also rejects a HIGH finding if the scanner incorrectly exits zero
   const report = complete(); report.Results[0].Vulnerabilities = [{ VulnerabilityID: 'CVE-2099-0001', Severity: 'HIGH' }];
   assert.equal(runMockScan(JSON.stringify(report), 0).status, 1);
 });
+test('production entrypoint rejects every unexpected CLI argument before invoking tools', () => {
+  for (const args of [['../../outside'], ['/tmp'], ['--target=/tmp'], ['--config', '/tmp/override']]) {
+    const result = spawnSync(process.execPath, [resolve('.github/scripts/scan-boot-jar.mjs'), ...args], {
+      encoding: 'utf8', env: {},
+    });
+    assert.equal(result.status, 1);
+    assert.match(result.stderr, /accepts no command-line arguments/);
+  }
+});
+test('target and extractor are derived from the repository rather than the current directory or CI overrides', () => {
+  const f = fixture();
+  const context = contextFor(f, { GITHUB_WORKSPACE: '/tmp/other-repository', TARGET_DIRECTORY: '/tmp' });
+  assert.equal(context.target, join(f.repo, 'Backend', 'target'));
+  assert.equal(context.extractor, join(f.repo, '.github', 'scripts', 'PrepareBootScan.java'));
+  assert.equal(context.java, join(f.javaHome, 'bin', 'java'));
+});
+test('unexpected, relative, traversal and option-like CI paths are rejected', () => {
+  const f = fixture();
+  for (const path of ['/tmp', '../outside', `${f.runnerTemp}/../_temp`, `${f.runnerTemp}//`, '--output=/tmp',
+    `${f.runnerTemp}\n`, `${f.runnerTemp};echo-unsafe`, '']) {
+    assert.throws(() => contextFor(f, { RUNNER_TEMP: path }));
+    assert.throws(() => contextFor(f, { TRIVY_CACHE_DIR: path }));
+    assert.throws(() => contextFor(f, { JAVA_HOME: path }));
+  }
+});
+test('symlink escapes in backend target, extractor, runner temp and cache are rejected', () => {
+  for (const key of ['target', 'runnerTemp', 'cache']) {
+    const f = fixture(), outside = join(f.work, 'outside'); mkdirSync(outside);
+    rmSync(f[key], { recursive: true }); symlinkSync(outside, f[key]);
+    assert.throws(() => contextFor(f), /Symbolic links/);
+  }
+  const f = fixture(), file = join(f.repo, '.github', 'scripts', 'PrepareBootScan.java');
+  rmSync(file); symlinkSync(extractor, file);
+  assert.throws(() => contextFor(f), /Symbolic links/);
+});
+test('invalid directory types and writable CI configuration directories are rejected', () => {
+  for (const key of ['target', 'runnerTemp', 'cache', 'javaHome']) {
+    const f = fixture(); rmSync(f[key], { recursive: true }); writeFileSync(f[key], 'not a directory');
+    assert.throws(() => contextFor(f));
+  }
+  for (const key of ['runnerTemp', 'cache', 'javaHome']) {
+    const f = fixture(); chmodSync(f[key], 0o777);
+    assert.throws(() => contextFor(f), /unsafe ownership or write permissions/);
+  }
+});
+test('Java must come from the provisioned Temurin 21 JDK and not arbitrary executables', () => {
+  const f = fixture();
+  assert.throws(() => contextFor(f, { JAVA_HOME: testJdk }), /outside its trusted root/);
+  const wrongJdk = join(f.javaCache, 'other-jdk'); mkdirSync(wrongJdk);
+  assert.throws(() => contextFor(f, { JAVA_HOME: wrongJdk }), /Temurin 21/);
+  rmSync(f.javaHome, { recursive: true }); symlinkSync(testJdk, f.javaHome);
+  assert.throws(() => contextFor(f), /Symbolic links/);
+});
+test('Java and Trivy validation rejects nonexecutables, empty files, directories and symlinks', () => {
+  for (const key of ['java', 'trivy']) {
+    for (const mutation of ['not-executable', 'empty', 'directory', 'symlink', 'writable']) {
+      const f = fixture(), path = f[key];
+      if (mutation === 'not-executable') chmodSync(path, 0o644);
+      if (mutation === 'empty') writeFileSync(path, '');
+      if (mutation === 'directory') { rmSync(path); mkdirSync(path); }
+      if (mutation === 'symlink') { rmSync(path); symlinkSync(testJava, path); }
+      if (mutation === 'writable') chmodSync(path, 0o777);
+      assert.throws(() => contextFor(f), `${key}: ${mutation}`);
+    }
+  }
+  const f = fixture();
+  assert.throws(() => validateExecutable(testJava, f.javaHome), /outside its trusted root/);
+});
+test('child execution uses absolute executables, argument arrays and a restricted environment with the real DB cache', () => {
+  const result = runMockScan(JSON.stringify(complete()), 0, { ci: {
+    PATH: '/attacker/bin', LD_PRELOAD: '/tmp/untrusted.so', NODE_OPTIONS: '--inspect',
+    JAVA_TOOL_OPTIONS: '-javaagent:/tmp/agent.jar', TRIVY_SKIP_FILES: '*', TRIVY_EXIT_CODE: '0',
+  } });
+  assert.equal(result.status, 0);
+  const [java, trivy] = result.calls;
+  assert.equal(java.executable, result.fixture.java);
+  assert.equal(trivy.executable, '/usr/local/bin/trivy');
+  assert.equal(trivy.processOptions.env.TRIVY_CACHE_DIR, result.fixture.cache);
+  for (const call of result.calls) {
+    assert.ok(Array.isArray(call.args)); assert.equal(call.processOptions.shell, false);
+    assert.equal(call.processOptions.cwd, result.fixture.repo);
+    assert.deepEqual(Object.keys(call.processOptions.env).sort(),
+      ['HOME', 'TMPDIR', 'LANG', 'LC_ALL', call === java ? 'JAVA_HOME' : 'TRIVY_CACHE_DIR'].sort());
+    assert.ok(call.processOptions.env.HOME.startsWith(`${result.fixture.runnerTemp}/trivy-backend-`));
+    assert.ok(call.processOptions.env.TMPDIR.startsWith(`${result.fixture.runnerTemp}/trivy-backend-`));
+  }
+});
+test('signal termination and extractor failures remain failures and cannot reach a success path', () => {
+  assert.equal(runMockScan(JSON.stringify(complete()), null, { signal: 'SIGTERM' }).status, 143);
+  const f = fixture(); let calls = 0;
+  assert.equal(scanBootJar(contextFor(f), () => { calls++; return { status: 9 }; }), 9);
+  assert.equal(calls, 1);
+  assert.throws(() => scanBootJar(contextFor(f), () => ({ error: new Error('executable unavailable') })),
+    /executable unavailable/);
+});
+
+test('writable JDK ancestors and executable parent directories are rejected', () => {
+  for (const path of [f => join(f.javaCache, 'Java_Temurin-Hotspot_jdk'),
+    f => join(f.javaCache, 'Java_Temurin-Hotspot_jdk', '21.0.13-11'),
+    f => join(f.javaHome, 'bin'), f => join(f.work, 'install', 'bin')]) {
+    const f = fixture(); chmodSync(path(f), 0o777);
+    assert.throws(() => contextFor(f), /unsafe ownership or write permissions/);
+  }
+});
+test('the provider shared tool-cache container can be writable while JDK descendants remain protected', () => {
+  const f = fixture(); chmodSync(f.javaCache, 0o777);
+  assert.equal(contextFor(f).java, f.java);
+  chmodSync(join(f.javaHome, 'bin'), 0o777);
+  assert.throws(() => contextFor(f), /unsafe ownership or write permissions/);
+});
+test('all 114 embedded dependencies must be identified, including the final archive', () => {
+  const paths = Array.from({ length: 114 }, (_, i) => `BOOT-INF/lib/dependency-${i}-1.0.jar`);
+  const report = { SchemaVersion: 2, Results: [{ Target: 'Java', Class: 'lang-pkgs', Type: 'jar',
+    Packages: paths.map((path, i) => pkg(path, 'org.example', `dependency-${i}`, '1.0')) }] };
+  assert.equal(validateInventory(paths, report), false);
+  report.Results[0].Packages.pop();
+  assert.throws(() => validateInventory(paths, report), /dependency-113-1.0.jar/);
+});
+test('automatic-analysis configuration excludes only exact immutable migrations from duplication', () => {
+  const settings = readFileSync('.sonarcloud.properties', 'utf8').split('\n')
+    .filter(line => line.trim() && !line.startsWith('#'));
+  assert.equal(settings.length, 1);
+  assert.ok(settings[0].startsWith('sonar.cpd.exclusions='));
+  const paths = settings[0].slice('sonar.cpd.exclusions='.length).split(',');
+  const migrationRoot = 'Backend/src/main/resources/db/migration/';
+  const expected = readdirSync(migrationRoot, { recursive: true })
+    .filter(path => /(^|\/)V[1-9]__[^/]+\.sql$/.test(path)).map(path => migrationRoot + path).sort();
+  assert.equal(paths.length, 10);
+  assert.deepEqual(paths, expected);
+  assert.ok(paths.every(path => /^Backend\/src\/main\/resources\/db\/migration\/(platform|billing)\/V[1-9]__[^/]+\.sql$/.test(path)));
+  assert.ok(paths.every(path => !path.includes('*')));
+});
+
 test('Gitleaks exceptions contain only the two owner-reviewed historical fingerprints', () => {
   assert.deepEqual(readFileSync('.gitleaksignore', 'utf8').trim().split('\n'), [
     'f8732921a9b1127064990557c2eb407c9efbc901:docs/security/phase04-authentication-foundation.md:generic-api-key:107',

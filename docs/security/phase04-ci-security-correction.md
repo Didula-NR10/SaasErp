@@ -33,7 +33,7 @@ The [report structs](https://github.com/aquasecurity/trivy/blob/v0.76.2/pkg/type
 The workflow invokes:
 
 ```sh
-node .github/scripts/scan-boot-jar.mjs Backend/target "$RUNNER_TEMP"
+node .github/scripts/scan-boot-jar.mjs
 ```
 
 The helper creates a unique directory under `RUNNER_TEMP`. `PrepareBootScan.java` runs with the existing JDK 21 and standard ZIP/manifest APIs, without Maven or new dependencies. It requires exactly one regular `.jar` candidate, a Spring Boot `JarLauncher` manifest with `Start-Class`, compiled launcher/application class headers, and a nonempty embedded dependency inventory. Multiple JAR candidates are rejected rather than guessed.
@@ -43,11 +43,12 @@ Before writing files, it rejects duplicate normalized paths, absolute paths, tra
 The actual scanner invocation is equivalent to:
 
 ```sh
-trivy fs \
+/usr/local/bin/trivy rootfs \
   --config '' \
   --ignorefile '' \
   --ignore-unfixed=false \
   --scanners vuln \
+  --pkg-types library \
   --severity HIGH,CRITICAL \
   --exit-code 1 \
   --list-all-pkgs \
@@ -68,3 +69,47 @@ The original scanner status is retained even if inventory validation fails, so a
 - Workflow YAML parsed with duplicate-key rejection using the already cached SnakeYAML library. A structural comparison against the original workflow confirmed that all prior settings remain identical except the intended artifact scan command and added regression step; all **11 workflow run blocks passed `bash -n`**. `git diff --check` also passed.
 
 Neither scanner is installed locally. No local Trivy Java database was downloaded, Docker image rebuilt, Maven command run, or commit/push made. GitHub Actions must still execute the corrected workflow with the pinned scanners and refreshed databases, confirm full-history Gitleaks behavior with exactly these two exceptions, identify every packaged dependency, enforce HIGH/CRITICAL findings including unfixed findings, and retain both required check results. No actual scanner success is claimed here.
+
+
+## SonarCloud PR #4 security and immutable-migration correction
+
+The public project settings for `Didula-NR10_SaasErp` returned `sonar.autoscan.enabled=true`. Repository inspection found no SonarScanner workflow, Maven analysis configuration, `sonar-project.properties` or prior `.sonarcloud.properties`. The PR check is published by the SonarQube Cloud GitHub application. This correction preserves automatic analysis; it does not add a second CI analysis.
+
+### Artifact scanner trust boundaries
+
+| Reported issue | Correction |
+| --- | --- |
+| `jssecurity:S8707`, CLI path traversal | The production entrypoint accepts no arguments. Repository root comes from `import.meta.url`; the only target is its fixed `Backend/target` directory and the only extractor is the adjacent checked-in helper. Temp storage is derived from the default hosted checkout layout and must equal `RUNNER_TEMP`. Cache storage must be the canonical `trivy-cache` child and must equal `TRIVY_CACHE_DIR`. Relative, option-like, malformed, unexpected and symlink-resolved paths and invalid directory types deny before tools run. |
+| `jssecurity:S8705`, command argument injection | CLI paths are removed. Process arguments are arrays of fixed options and validated absolute paths; `shell: false` is explicit. No shell command concatenation or interpolation is used. |
+| `javascript:S4036`, Java PATH resolution | Java is the validated absolute `JAVA_HOME/bin/java` from the fixed `/opt/hostedtoolcache/Java_Temurin-Hotspot_jdk/21.<version>/x64` installation provisioned by `actions/setup-java@v5`. The canonical installation, JDK descendant directories, executable type, ownership, execute permission and nonwritable group/other modes are checked. There is no fallback to PATH. |
+| `javascript:S4036`, Trivy PATH resolution | The scanner validates and invokes `/usr/local/bin/trivy`, matching the workflow's installation destination. A missing, empty, nonexecutable, symlinked or group/other-writable executable fails closed. There is no CLI/environment override for this executable. |
+
+The JDK naming and `JAVA_HOME` provisioning were checked against the official [setup-java base installer](https://github.com/actions/setup-java/blob/v5/src/distributions/base-installer.ts) and [Temurin installer](https://github.com/actions/setup-java/blob/v5/src/distributions/temurin/installer.ts). GitHub's [hosted-image environment setup](https://github.com/actions/runner-images/blob/main/images/ubuntu/scripts/build/configure-environment.sh) deliberately makes the top-level tool-cache container writable. That fixed provider-owned/current-user-owned container is accepted; protected JDK descendant directories and executable checks still apply. No host permissions are changed by this correction.
+
+Child processes receive private HOME/TMPDIR directories and fixed locale values. Java receives only its validated JAVA_HOME in addition to those base values. Trivy receives only the validated database cache in addition to those base values. PATH, inherited JVM/loader options, credentials and arbitrary TRIVY_* overrides are not forwarded. The workflow's vulnerability/Java database restore/update/save paths are retained, as are rootfs mode, explicit library scanning, every-dependency path/identity validation, HIGH/CRITICAL enforcement including unfixed findings, and scanner status propagation.
+
+`PrepareBootScan.java` is unchanged. Its duplicate/traversal/unexpected-entry, fresh-directory, regular-file, manifest/class, size/CRC and embedded-archive checks remain covered by the original regression cases. The test harness now invokes its compiler/JVM by absolute paths and substitutes Trivy only through an in-process process-runner test seam; production does not accept test configuration through arguments or environment variables.
+
+This entrypoint deliberately supports the current `ubuntu-latest`, default checkout, x64 Temurin 21 tool-cache layout. A changed runner layout or tool distribution fails closed and needs an explicit code/test review. Filesystem ownership and tool provenance still rely on the trusted ephemeral runner; this does not sandbox arbitrary malicious code already executing as the runner user or root.
+
+### Duplication-only exclusion for immutable Flyway history
+
+V5–V9 deliberately preserve and replace PostgreSQL security function definitions. Refactoring prior migration bodies would change Flyway checksums and the upgrade path for already migrated databases. Moving historical definitions into mutable shared includes would also change their meaning. Applied migrations are historical records, so repeated replacement definitions are justified duplication; normal application duplication remains subject to the existing 3% gate.
+
+The official [automatic-analysis configuration](https://docs.sonarsource.com/sonarqube-cloud/analyzing-source-code/automatic-analysis#additional-analysis-configuration) explicitly supports `sonar.cpd.exclusions` in `.sonarcloud.properties` on the default branch, while warning that wildcard patterns are not allowed there. The added root file therefore contains only `sonar.cpd.exclusions`, with the ten exact existing migration paths: billing V1 and platform V1–V9. It uses no wildcard and no source/security exclusion. It leaves all applicable static/security issue analysis of the migration files enabled. Java, JavaScript, infrastructure, repeatable SQL and other application sources retain normal duplication checks. No migration, security requirement ID, security rule, rating requirement or quality-gate threshold is changed.
+
+The exact repository property value is in [`.sonarcloud.properties`](../../.sonarcloud.properties). New migrations are not silently added to that exact list; any extension requires review.
+
+For PR #4 before that file reaches the default branch, the project administrator can configure the same exact comma-separated list in **Administration → General Settings → Analysis Scope → Duplication → Duplication Exclusions**. Alternatively, the UI supports this narrowly scoped versioned-Flyway path pattern (UI only):
+
+```properties
+sonar.cpd.exclusions=Backend/src/main/resources/db/migration/**/V*__*.sql
+```
+
+The [official duplication-exclusion documentation](https://docs.sonarsource.com/sonarqube-cloud/managing-your-projects/project-analysis/setting-analysis-scope/exclude-from-coverage-duplication) documents the property and UI path, and [path-pattern semantics](https://docs.sonarsource.com/sonarqube-cloud/appendices/defining-matching-patterns) document the wildcard form. This is a duplication-only project setting, not `sonar.exclusions`. Do not add `sonar-project.properties` for automatic analysis; it is ignored in this mode. Do not disable automatic analysis or introduce a parallel analysis job for this change.
+
+### Verification and owner actions
+
+The existing lightweight Node.js suite plus new negative security cases passed: **29 tests, zero failures, cancellations or skips**. This includes real standalone-extractor execution against synthetic stored/deflated JAR fixtures; malformed/missing reports; every-dependency Maven identity checks; the explicit 114-library completeness case; rootfs/library/severity flags; scanner statuses 1, 2, 17 and signal exit 143; unexpected CLI arguments; unsafe CI paths; symlink escapes; invalid/writable executable and JDK paths; and the restricted child environment/cache behavior. Script syntax checks passed. No Maven build, Trivy database download, Docker rebuild, application change, migration change, commit or push was performed.
+
+Owner actions remain: apply the duplication-only project setting for the current PR if needed, review/land the default-branch configuration through the normal process, and trigger fresh SonarCloud and GitHub Actions runs. Confirm both the Security A rating and duplication ≤3%, review whether any remaining duplication is outside immutable migrations, and confirm the hardened runner paths/cache with live rootfs scanning of all 114 packaged libraries. Local mocked scanner tests do not establish live scanner success or Sonar issue closure. No new remote success is claimed.

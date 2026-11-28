@@ -177,4 +177,4 @@ jobs:
 
       - name: Scan packaged Spring Boot JAR and require complete Java inventory
         if: ${{ !cancelled() && steps.package-backend.outcome == 'success' && steps.trivy-db.outcome == 'success' }}
-        run: node .github/scripts/scan-boot-jar.mjs Backend/target "$RUNNER_TEMP"
+        run: node .github/scripts/scan-boot-jar.mjs
