@@ -11,7 +11,7 @@ Business features are organized into independent modules.
 
 - Java 21
 - Spring Boot
-- Spring Security and JWT
+- Spring Security and Redis-backed server-side sessions (ADR-0004)
 - PostgreSQL
 - Redis
 - Flyway

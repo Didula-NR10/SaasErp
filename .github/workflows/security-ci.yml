@@ -65,7 +65,7 @@ jobs:
   vulnerability-scan:
     name: Trivy Vulnerability Scan
     runs-on: ubuntu-latest
-    timeout-minutes: 15
+    timeout-minutes: 30
 
     steps:
 
@@ -83,6 +83,9 @@ jobs:
           java-version: '21'
           cache: maven
           cache-dependency-path: Backend/pom.xml
+
+      - name: Verify packaged scan security guards
+        run: node --test .github/scripts/security-ci.test.mjs
 
       # Populate the local Maven repository
 
@@ -105,9 +108,45 @@ jobs:
 
           trivy --version
 
+      # Cache only databases, never scan results. Every run still checks for updates.
+
+      - name: Configure Trivy cache
+        id: trivy-cache
+        run: |
+          echo "TRIVY_CACHE_DIR=$RUNNER_TEMP/trivy-cache" >> "$GITHUB_ENV"
+          echo "date=$(date -u +%F)" >> "$GITHUB_OUTPUT"
+
+      - name: Restore Trivy databases
+        id: trivy-db-cache
+        uses: actions/cache/restore@v4
+        with:
+          path: |
+            ${{ runner.temp }}/trivy-cache/db
+            ${{ runner.temp }}/trivy-cache/java-db
+          key: trivy-db-${{ runner.os }}-0.76.2-${{ steps.trivy-cache.outputs.date }}
+          restore-keys: |
+            trivy-db-${{ runner.os }}-0.76.2-
+
+      - name: Update Trivy vulnerability and Java databases
+        id: trivy-db
+        run: |
+          set -euo pipefail
+          trivy fs --download-db-only --no-progress
+          trivy fs --download-java-db-only --no-progress
+
+      - name: Save updated Trivy databases
+        if: ${{ steps.trivy-db-cache.outputs.cache-hit != 'true' }}
+        uses: actions/cache/save@v4
+        with:
+          path: |
+            ${{ runner.temp }}/trivy-cache/db
+            ${{ runner.temp }}/trivy-cache/java-db
+          key: ${{ steps.trivy-db-cache.outputs.cache-primary-key }}
+
       # Scan third-party dependencies
 
       - name: Scan dependency vulnerabilities
+        if: ${{ !cancelled() }}
         run: |
           trivy fs \
             --scanners vuln \
@@ -119,9 +158,23 @@ jobs:
       # Scan infrastructure configurations
 
       - name: Scan infrastructure configuration
+        if: ${{ !cancelled() }}
         run: |
           trivy config \
             --severity HIGH,CRITICAL \
             --exit-code 1 \
             --format table \
             .
+
+      # This packaging pass does not replace Backend CI's clean verify/test/ArchUnit gate.
+      # Reuse setup-java's existing Maven cache; do not force dependency updates with -U.
+
+      - name: Package backend for dependency scanning
+        id: package-backend
+        if: ${{ !cancelled() }}
+        working-directory: Backend
+        run: mvn -B -ntp -DskipTests package
+
+      - name: Scan packaged Spring Boot JAR and require complete Java inventory
+        if: ${{ !cancelled() && steps.package-backend.outcome == 'success' && steps.trivy-db.outcome == 'success' }}
+        run: node .github/scripts/scan-boot-jar.mjs

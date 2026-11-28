@@ -1,0 +1,9 @@
+.account-protection { max-width: 54rem; margin: 2rem auto; padding: 1.5rem; font-family: system-ui, sans-serif; }
+.account-protection fieldset { margin: 1.5rem 0; padding: 1rem; border: 1px solid #ccd3dc; border-radius: .5rem; }
+.account-protection form { display: grid; gap: .75rem; margin: 1rem 0; }
+.account-protection label { display: grid; gap: .3rem; }
+.account-protection input, .account-protection textarea { width: 100%; padding: .65rem; border: 1px solid #94a3b8; border-radius: .3rem; box-sizing: border-box; }
+.account-protection button { padding: .65rem .85rem; margin: .2rem; cursor: pointer; }
+.account-protection .security-actions { display: flex; flex-wrap: wrap; gap: .4rem; }
+.account-protection code { overflow-wrap: anywhere; }
+.account-protection textarea { min-height: 5rem; }
